@@ -24,7 +24,7 @@
   .fld { margin-top: .25rem; display: block; width: 100%; border: 1px solid #cbd5e1; border-radius: .375rem;
          padding: .5rem .75rem; font-size: .875rem; background: #fff; color: #0f172a; }
   .fld:focus { outline: 2px solid #0e6a8a; outline-offset: 0; border-color: #0e6a8a; }
-  fieldset:disabled .fld { background: #f1f5f9; color: #475569; }
+  fieldset:disabled .fld, .fld[readonly] { background: #f1f5f9; color: #475569; }
   .btn { display: inline-flex; align-items: center; gap: .4rem; border-radius: .375rem; padding: .5rem .9rem;
          font-size: .875rem; font-weight: 500; cursor: pointer; }
   .btn:focus-visible { outline: 2px solid #0e6a8a; outline-offset: 2px; }
@@ -79,7 +79,8 @@ const PERMS = [
   { key: 'delete_esp',       label: 'Supprimer un ESP' },
   { key: 'enter_control',    label: 'Saisir un rapport de contrôle' },
   { key: 'validate_control', label: 'Valider / Clôturer un contrôle' },
-  { key: 'open_carl',        label: 'Ouvrir CARL Source depuis les écarts (clic sur un n° d\'intervention)' },
+  { key: 'open_carl',        label: 'CARL Source : consulter (clic sur les n° d\'intervention, sans modification)' },
+  { key: 'edit_carl',        label: 'CARL Source : consulter + ajouter / modifier / supprimer les écarts' },
   { key: 'view_audit',       label: "Consulter le journal d'audit" },
   { key: 'manage_users',     label: 'Gérer les utilisateurs' }
 ];
@@ -170,6 +171,7 @@ function initFirebase() {
   if (ENABLE_FILE_UPLOAD) storage = firebase.storage();
 }
 const can = p => !!state.user && (state.user.role === 'admin' || !!state.user.permissions?.[p]);
+const canCarl = () => canCarl() || can('edit_carl');   // clic vers CARL : le droit de modification inclut la consultation
 const espById = id => state.esp.find(e => e.id === id);
 /* Visibilité par service / pôle : liste vide = tous les pôles ; l'admin voit tout */
 const userPoles = () => (!state.user || state.user.role === 'admin') ? [] : (state.user.poles || []);
@@ -604,7 +606,7 @@ function exportCsv() {
 const inp = (name, label, val = '', o = {}) => `<label class="block text-sm font-medium ${o.span || ''}">${label}${o.req ? ' *' : ''}
   <input class="fld" name="${name}" type="${o.type || 'text'}" value="${esc(val)}" ${o.req ? 'required' : ''} ${o.attr || ''}></label>`;
 const sel = (name, label, arr, val, o = {}) => `<label class="block text-sm font-medium ${o.span || ''}">${label}${o.req ? ' *' : ''}
-  <select class="fld" name="${name}" ${o.req ? 'required' : ''}>${opt(arr, val, o.blank === false ? null : (o.blank || '—'))}</select></label>`;
+  <select class="fld" name="${name}" ${o.req ? 'required' : ''} ${o.attr || ''}>${opt(arr, val, o.blank === false ? null : (o.blank || '—'))}</select></label>`;
 
 /* Champ Service / Pôle : liste fermée pour un utilisateur restreint, saisie assistée sinon */
 function poleField(e) {
@@ -690,12 +692,12 @@ const resultBadge = r => r ? badge(r, { 'Conforme': 'green', 'Conforme avec rés
 
 const GAP_OPTS = ['Oui', 'Non'];
 const isCarlNo = n => /^\d{6}$/.test(String(n || '').trim());
-const carlLink = c => isCarlNo(c.gapNumber) && can('open_carl')
+const carlLink = c => isCarlNo(c.gapNumber) && canCarl()
   ? `<a href="${esc(CARL_URL)}" target="_blank" rel="noopener noreferrer" data-copy="${esc(String(c.gapNumber).trim())}" class="font-medium text-sky-700 underline" title="Ouvrir CARL Source (le n° ${esc(c.gapNumber)} est copié pour la recherche)">${esc(c.gapNumber)} ↗</a>`
   : `<span class="font-medium"${isCarlNo(c.gapNumber) ? ' title="Accès à CARL non autorisé pour votre compte"' : ''}>${esc(c.gapNumber)}</span>`;
 document.addEventListener('click', ev => {   // copie du n° d'intervention au clic sur le lien CARL
   const a = ev.target.closest('a[data-copy]'); if (!a) return;
-  if (!can('open_carl')) { ev.preventDefault(); toast("Votre compte n'est pas autorisé à ouvrir CARL Source.", 'err'); return; }   // contrôle d'accès : le clic est bloqué
+  if (!canCarl()) { ev.preventDefault(); toast("Votre compte n'est pas autorisé à ouvrir CARL Source.", 'err'); return; }   // contrôle d'accès : le clic est bloqué
   navigator.clipboard?.writeText(a.dataset.copy).then(() => toast(`N° ${a.dataset.copy} copié : collez-le dans la recherche CARL Source`, 'info'), () => {});
 });
 const gapOf = c => c.gapRequired === 'Oui' ? 'Oui' : 'Non';
@@ -703,16 +705,16 @@ const gapOf = c => c.gapRequired === 'Oui' ? 'Oui' : 'Non';
 const gapsOf = c => Array.isArray(c.gaps) ? c.gaps.filter(x => x && (x.number || x.label))
   : ((c.gapNumber || c.gapLabel) ? [{ number: c.gapNumber || '', label: c.gapLabel || '' }] : []);
 const GAP_MAX_INLINE = 3;   // nombre maximum de n° d'intervention affichés dans la liste des contrôles
-const gapRow = x => `<div data-gap-row class="grid sm:grid-cols-[1fr_2fr_auto] gap-3 items-start">
+const gapRow = (x, ro) => `<div data-gap-row class="grid sm:grid-cols-[1fr_2fr_auto] gap-3 items-start">
     <div><label class="block text-sm font-medium">N° d'intervention CARL Source (6 chiffres)
-      <input class="fld" name="gapNumber" value="${esc(x.number)}" inputmode="numeric" maxlength="6" pattern="\\d{6}" title="6 chiffres"></label>
+      <input class="fld" name="gapNumber" value="${esc(x.number)}" inputmode="numeric" maxlength="6" pattern="\\d{6}" title="6 chiffres" ${ro ? 'readonly' : ''}></label>
       <div class="gap-link text-xs mt-1"></div></div>
     <label class="block text-sm font-medium">Désignation de l'écart (succincte)
-      <input class="fld" name="gapLabel" value="${esc(x.label)}" maxlength="200"></label>
-    <button type="button" class="btn btn-danger sm:mt-6" data-act="gap-del" title="Retirer cet écart">Retirer</button></div>`;
+      <input class="fld" name="gapLabel" value="${esc(x.label)}" maxlength="200" ${ro ? 'readonly' : ''}></label>
+    ${ro ? '<span></span>' : `<button type="button" class="btn btn-danger sm:mt-6" data-act="gap-del" title="Retirer cet écart">Retirer</button>`}</div>`;
 function updGapLink(row) {   // lien « Ouvrir CARL » sous le n° saisi (uniquement si le compte a le droit d'ouvrir CARL)
   const n = row.querySelector('[name=gapNumber]').value.trim();
-  row.querySelector('.gap-link').innerHTML = isCarlNo(n) && can('open_carl') ? carlLink({ gapNumber: n }).replace(/>\d{6} ↗</, '>Ouvrir CARL Source ↗<') : '';
+  row.querySelector('.gap-link').innerHTML = isCarlNo(n) && canCarl() ? carlLink({ gapNumber: n }).replace(/>\d{6} ↗</, '>Ouvrir CARL Source ↗<') : '';
 }
 const RESULT_RANK = { 'Conforme': 1, 'Conforme avec réserves': 2, 'Non conforme': 3 };
 /* Colonnes de la liste : clé de tri, libellé, valeur de tri (les valeurs vides sont toujours placées en fin de liste) */
@@ -796,6 +798,7 @@ function openCtrl(id, espId, preset) {
   if (id && (!c || !visibleIds().has(c.espId))) return;
   const locked = c.status === 'Clôturé' && !can('validate_control');
   const ro = !can('enter_control') || locked;
+  const gapLocked = ro || !can('edit_carl');   // écarts modifiables seulement avec le droit « CARL Source : consulter + modifier »
   ctrlAtt = (c.attachments || []).map(a => ({ ...a }));
   const statuses = CTRL_STATUS.filter(s => s !== 'Clôturé' || can('validate_control') || c.status === 'Clôturé');
   openModal(`
@@ -815,10 +818,11 @@ function openCtrl(id, espId, preset) {
       ${inp('doneDate', 'Date de réalisation', c.doneDate, { type: 'date' })}
       ${inp('inspector', 'Organisme / inspecteur', c.inspector)}
       ${sel('result', 'Résultat', RESULTS, c.result)}
-      ${sel('gapRequired', 'Écart à traiter', GAP_OPTS, gapOf(c), { blank: false })}
+      ${sel('gapRequired', 'Écart à traiter', GAP_OPTS, gapOf(c), { blank: false, attr: gapLocked ? 'disabled title="Modification des écarts non autorisée pour votre compte"' : '' })}
       <div class="hidden sm:col-span-2 rounded-md border border-red-200 bg-red-50/50 p-3" id="gap-fields">
-        <div id="gap-rows" class="grid gap-3">${(gapsOf(c).length ? gapsOf(c) : [{}]).map(gapRow).join('')}</div>
-        ${ro ? '' : `<button type="button" class="btn btn-ghost mt-3" data-act="gap-add">+ Ajouter un écart</button>`}
+        ${!ro && gapLocked ? `<p class="text-xs text-slate-600 mb-2">Consultation seule : votre compte n'est pas autorisé à ajouter, modifier ou supprimer des écarts.</p>` : ''}
+        <div id="gap-rows" class="grid gap-3">${(gapsOf(c).length ? gapsOf(c) : [{}]).map(x => gapRow(x, gapLocked)).join('')}</div>
+        ${gapLocked ? '' : `<button type="button" class="btn btn-ghost mt-3" data-act="gap-add">+ Ajouter un écart</button>`}
       </div>
       <label class="block text-sm font-medium sm:col-span-2">Commentaire / réserves<textarea class="fld" name="comment" rows="3">${esc(c.comment)}</textarea></label>
       <div class="sm:col-span-2">
@@ -1017,7 +1021,7 @@ function demoSpecs() {
   ];
 }
 const DEMO_USERS = [
-  { username: 'inspecteur', displayName: 'Camille Roux (responsable réglementaire)', perms: ['view_esp', 'edit_esp', 'enter_control', 'validate_control', 'open_carl', 'view_audit'], poles: [] },
+  { username: 'inspecteur', displayName: 'Camille Roux (responsable réglementaire)', perms: ['view_esp', 'edit_esp', 'enter_control', 'validate_control', 'edit_carl', 'view_audit'], poles: [] },
   { username: 'op.synthese', displayName: "Karim Benali (chef d'atelier Synthèse)", perms: ['view_esp', 'edit_esp', 'enter_control', 'open_carl'], poles: ['Synthèse aromatique'] },
   { username: 'lecture.utilites', displayName: 'Julie Martin (technicienne Utilités)', perms: ['view_esp'], poles: ['Utilités'] }
 ];
@@ -1151,9 +1155,11 @@ document.addEventListener('click', async ev => {
       case 'ctrl-new': openCtrl(null, el.dataset.esp); break;
       case 'ctrl-open': openCtrl(id); break;
       case 'gap-add': {
+        if (!can('edit_carl')) return toast("Modification des écarts non autorisée pour votre compte.", 'err');
         const box = $('#gap-rows'); box.insertAdjacentHTML('beforeend', gapRow({}));
         box.lastElementChild.querySelector('[name=gapNumber]').focus(); break; }
       case 'gap-del': {
+        if (!can('edit_carl')) return toast("Modification des écarts non autorisée pour votre compte.", 'err');
         const row = el.closest('[data-gap-row]'), box = $('#gap-rows');
         if (box.children.length > 1) { row.remove(); $('[data-act="gap-add"]')?.focus(); }
         else { row.querySelectorAll('input').forEach(i => { i.value = ''; }); updGapLink(row); }   // dernière ligne : on la vide
@@ -1220,8 +1226,9 @@ document.addEventListener('submit', async ev => {
       if (st !== 'Planifié' && !g('doneDate')) throw new Error('La date de réalisation est obligatoire pour un contrôle réalisé ou clôturé.');
       if (st === 'Clôturé' && !g('result')) throw new Error('Le résultat est obligatoire pour clôturer un contrôle.');
       if (st === 'Clôturé' && !can('validate_control')) throw new Error("Vous n'avez pas le droit de clôturer un contrôle.");
-      const gapYes = g('gapRequired') === 'Oui', gapLabels = fd.getAll('gapLabel');
-      const gaps = gapYes ? fd.getAll('gapNumber').map((n, k) => ({ number: String(n).trim(), label: String(gapLabels[k] || '').trim() })).filter(x => x.number || x.label) : [];
+      const gapEdit = can('edit_carl'), gapLabels = fd.getAll('gapLabel');   // sans droit d'édition : écarts existants conservés, valeurs du formulaire ignorées
+      const gapYes = gapEdit ? g('gapRequired') === 'Oui' : before?.gapRequired === 'Oui';
+      const gaps = !gapEdit ? (before?.gaps || []) : gapYes ? fd.getAll('gapNumber').map((n, k) => ({ number: String(n).trim(), label: String(gapLabels[k] || '').trim() })).filter(x => x.number || x.label) : [];
       if (gaps.some(x => x.number && !isCarlNo(x.number))) throw new Error("Le n° d'intervention CARL Source doit comporter exactement 6 chiffres.");
       const dup = gaps.map(x => x.number).filter((n, k, a) => n && a.indexOf(n) !== k)[0];
       if (dup) throw new Error(`Le n° d'intervention ${dup} est saisi plusieurs fois.`);
