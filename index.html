@@ -87,6 +87,9 @@ const CATEGORIES  = ['Art. 4§3 (SEP)', 'I', 'II', 'III', 'IV'];
 const ATEX_ZONES  = ['Hors zone', 'Zone 1', 'Zone 2', 'Zone 21', 'Zone 22'];
 const STATUSES    = ['En service', 'À l\'arrêt / Consigné', 'Isolé', 'Hors service / Rébuté'];
 const OUT_STATUS  = 'Hors service / Rébuté';               // exclu du suivi des échéances
+// Écran de sélection des interventions dans CARL Source : tous les n° d'intervention pointent vers cette page.
+// (L'adresse ne contient pas le n° : il est copié dans le presse-papiers au clic, pour être collé dans la recherche CARL.)
+const CARL_URL = 'https://pgmao-bsl.emea.sesam.mane.com/gmaoCS02/works/WO-SEL.faces?carl_screen_field=d64a27db-1b46-4813-bece-1945a9a27511_1';
 const PLAN_HORIZON_DAYS = 90;                               // une échéance échue ou à ≤ N jours doit avoir un contrôle planifié
 const PLAN_FILTER = 'Échéance sans planification';         // valeur du filtre de la liste des ESP
 const CTRL_TYPES  = ['Visite périodique', 'Requalification périodique', 'Contrôle après intervention notable'];
@@ -108,7 +111,7 @@ const FL = { // libellés des champs pour le journal d'audit
   rpMonths: 'Périodicité requalif. (mois)', notes: 'Remarques',
   espId: 'Équipement', plannedDate: 'Date planifiée', doneDate: 'Date de réalisation', inspector: 'Organisme / inspecteur',
   result: 'Résultat', comment: 'Commentaire', attachments: 'Pièces jointes', validatedBy: 'Validé par', validatedAt: 'Validé le',
-  gapRequired: 'Écart à traiter', gapNumber: "N° d'écart", gapLabel: "Désignation de l'écart",
+  gapRequired: 'Écart à traiter', gapNumber: "N° d'intervention CARL", gapLabel: "Désignation de l'écart",
   displayName: 'Nom affiché', active: 'Compte actif', permissions: 'Permissions', password: 'Mot de passe'
 };
 
@@ -684,6 +687,14 @@ const ctrlStatusBadge = s => badge(s || '—', { 'Planifié': 'blue', 'Réalisé
 const resultBadge = r => r ? badge(r, { 'Conforme': 'green', 'Conforme avec réserves': 'orange', 'Non conforme': 'red' }[r]) : '—';
 
 const GAP_OPTS = ['Oui', 'Non'];
+const isCarlNo = n => /^\d{6}$/.test(String(n || '').trim());
+const carlLink = c => isCarlNo(c.gapNumber)
+  ? `<a href="${esc(CARL_URL)}" target="_blank" rel="noopener noreferrer" data-copy="${esc(String(c.gapNumber).trim())}" class="font-medium text-sky-700 underline" title="Ouvrir CARL Source (le n° ${esc(c.gapNumber)} est copié pour la recherche)">${esc(c.gapNumber)} ↗</a>`
+  : `<span class="font-medium">${esc(c.gapNumber)}</span>`;
+document.addEventListener('click', ev => {   // copie du n° d'intervention au clic sur le lien CARL
+  const a = ev.target.closest('a[data-copy]'); if (!a) return;
+  navigator.clipboard?.writeText(a.dataset.copy).then(() => toast(`N° ${a.dataset.copy} copié : collez-le dans la recherche CARL Source`, 'info'), () => {});
+});
 const gapOf = c => c.gapRequired === 'Oui' ? 'Oui' : 'Non';
 const RESULT_RANK = { 'Conforme': 1, 'Conforme avec réserves': 2, 'Non conforme': 3 };
 /* Colonnes de la liste : clé de tri, libellé, valeur de tri (les valeurs vides sont toujours placées en fin de liste) */
@@ -740,7 +751,7 @@ function ctrlTable() {
   ${rows.map(c => { const e = espById(c.espId), g = gapOf(c) === 'Oui';
     return `<tr data-act="ctrl-open" data-id="${c.id}"><td class="font-medium">${esc(e?.tag || '(supprimé)')}</td><td>${esc(e?.name || '—')}</td><td>${esc(c.type)}</td><td>${ctrlStatusBadge(c.status)}</td>
     <td>${fmtDate(c.plannedDate)}</td><td>${fmtDate(c.doneDate)}</td><td>${esc(c.inspector)}</td><td>${resultBadge(c.result)}</td>
-    <td>${badge(g ? 'Oui' : 'Non', g ? 'red' : 'gray')}${g && (c.gapNumber || c.gapLabel) ? `<div class="text-xs text-slate-600 mt-1">${c.gapNumber ? `<span class="font-medium">${esc(c.gapNumber)}</span>` : ''}${c.gapNumber && c.gapLabel ? ' · ' : ''}${esc(c.gapLabel)}</div>` : ''}</td>
+    <td>${badge(g ? 'Oui' : 'Non', g ? 'red' : 'gray')}${g && (c.gapNumber || c.gapLabel) ? `<div class="text-xs text-slate-600 mt-1">${c.gapNumber ? carlLink(c) : ''}${c.gapNumber && c.gapLabel ? ' · ' : ''}${esc(c.gapLabel)}</div>` : ''}</td>
     <td>${(c.attachments || []).length}</td></tr>`; }).join('')
     || `<tr><td colspan="10" class="text-slate-500">Aucun contrôle enregistré.</td></tr>`}</tbody></table>`;
 }
@@ -778,7 +789,8 @@ function openCtrl(id, espId, preset) {
       ${sel('result', 'Résultat', RESULTS, c.result)}
       ${sel('gapRequired', 'Écart à traiter', GAP_OPTS, gapOf(c), { blank: false })}
       <div class="hidden sm:col-span-2 grid sm:grid-cols-[1fr_2fr] gap-3 rounded-md border border-red-200 bg-red-50/50 p-3" id="gap-fields">
-        ${inp('gapNumber', "N° d'écart (autre outil)", c.gapNumber)}
+        <div>${inp('gapNumber', "N° d'intervention CARL Source (6 chiffres)", c.gapNumber, { attr: 'inputmode="numeric" maxlength="6" pattern="\\d{6}" title="6 chiffres"' })}
+          <div id="gap-link" class="text-xs mt-1"></div></div>
         ${inp('gapLabel', "Désignation de l'écart (succincte)", c.gapLabel, { attr: 'maxlength="200"' })}
       </div>
       <label class="block text-sm font-medium sm:col-span-2">Commentaire / réserves<textarea class="fld" name="comment" rows="3">${esc(c.comment)}</textarea></label>
@@ -800,6 +812,8 @@ function openCtrl(id, espId, preset) {
   </form>`);
   const showGap = () => $('#gap-fields').classList.toggle('hidden', $('[name=gapRequired]').value !== 'Oui');
   $('[name=gapRequired]').addEventListener('change', showGap); showGap();
+  const showLink = () => { const n = $('[name=gapNumber]').value.trim(); $('#gap-link').innerHTML = isCarlNo(n) ? carlLink({ gapNumber: n }).replace(/>\d{6} ↗</, '>Ouvrir CARL Source ↗<') : ''; };
+  $('[name=gapNumber]').addEventListener('input', showLink); showLink();
 }
 
 /* =====================================================================
@@ -1071,6 +1085,7 @@ $('#modal').addEventListener('mousedown', e => { if (e.target.id === 'modal' || 
    16. ÉVÉNEMENTS (délégation)
    ===================================================================== */
 document.addEventListener('click', async ev => {
+  if (ev.target.closest('a[href]')) return;   // lien externe (ex. CARL Source) : comportement normal, sans ouvrir la fiche de la ligne
   const el = ev.target.closest('[data-act]'); if (!el) return;
   const id = el.dataset.id;
   try {
@@ -1170,6 +1185,7 @@ document.addEventListener('submit', async ev => {
       if (st !== 'Planifié' && !g('doneDate')) throw new Error('La date de réalisation est obligatoire pour un contrôle réalisé ou clôturé.');
       if (st === 'Clôturé' && !g('result')) throw new Error('Le résultat est obligatoire pour clôturer un contrôle.');
       if (st === 'Clôturé' && !can('validate_control')) throw new Error("Vous n'avez pas le droit de clôturer un contrôle.");
+      if (g('gapRequired') === 'Oui' && g('gapNumber') && !isCarlNo(g('gapNumber'))) throw new Error("Le n° d'intervention CARL Source doit comporter exactement 6 chiffres.");
       const att = [...ctrlAtt];
       const files = [...(form.elements.files?.files || [])];
       for (const f of files) {
