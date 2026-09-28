@@ -297,9 +297,13 @@ function startSession(u) {
 }
 function logout() {
   unsubs.splice(0).forEach(f => f()); sessionStorage.removeItem('esp_user');
-  Object.assign(state, { user: null, esp: [], controls: [], audit: [], users: [] });
+  Object.assign(state, { user: null, esp: [], controls: [], audit: [], users: [],
+    fDash: { pole: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' });
   closeModal(); renderLogin();
 }
+/* Signature canonique des droits : Firestore ne garantit pas l'ordre des clés d'une map (cache local vs serveur),
+   donc on compare rôle + permissions actives + pôles TRIÉS, sinon les écouteurs sont relancés en boucle. */
+const userSig = u => JSON.stringify([u.role || '', Object.keys(u.permissions || {}).filter(k => u.permissions[k]).sort(), [...(u.poles || [])].sort()]);
 function startListeners() {
   unsubs.splice(0).forEach(f => f());
   const err = e => { console.error(e); toast('Erreur Firestore : ' + e.message, 'err'); };
@@ -307,9 +311,9 @@ function startListeners() {
   // Le profil courant est surveillé : changement de droits ou désactivation pris en compte en direct
   unsubs.push(db.collection('users').doc(state.user.username).onSnapshot(s => {
     if (!s.exists || s.data().active === false) { toast('Session terminée : compte supprimé ou désactivé.', 'err'); return logout(); }
-    const sig = u => JSON.stringify([u.permissions, u.poles]); const prev = sig(state.user);
+    const prev = userSig(state.user);
     state.user = s.data();
-    if (prev !== sig(state.user)) setTimeout(() => { startListeners(); renderShell(); }, 0);
+    if (prev !== userSig(state.user)) setTimeout(() => { startListeners(); renderShell(); }, 0);
   }, err));
   unsubs.push(db.collection('esp').onSnapshot(s => { state.esp = list(s); renderView(); }, err));
   unsubs.push(db.collection('controls').onSnapshot(s => { state.controls = list(s); renderView(); }, err));
