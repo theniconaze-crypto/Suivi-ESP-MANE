@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP Manager – Suivi des contrôles réglementaires</title>
+
+<!-- ===== Dépendances CDN ===== -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { theme: { extend: { fontFamily: { sans: ['"IBM Plex Sans"', 'system-ui', 'sans-serif'] } } } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-storage-compat.js"></script>
+
+<style>
+  body { font-variant-numeric: tabular-nums; }
+  .fld { margin-top: .25rem; display: block; width: 100%; border: 1px solid #cbd5e1; border-radius: .375rem;
+         padding: .5rem .75rem; font-size: .875rem; background: #fff; color: #0f172a; }
+  .fld:focus { outline: 2px solid #0e6a8a; outline-offset: 0; border-color: #0e6a8a; }
+  fieldset:disabled .fld { background: #f1f5f9; color: #475569; }
+  .btn { display: inline-flex; align-items: center; gap: .4rem; border-radius: .375rem; padding: .5rem .9rem;
+         font-size: .875rem; font-weight: 500; cursor: pointer; }
+  .btn:focus-visible { outline: 2px solid #0e6a8a; outline-offset: 2px; }
+  .btn-primary { background: #0e6a8a; color: #fff; } .btn-primary:hover { background: #0b566f; }
+  .btn-ghost { background: #fff; color: #1e293b; border: 1px solid #cbd5e1; } .btn-ghost:hover { background: #f1f5f9; }
+  .btn-danger { background: #fff; color: #b91c1c; border: 1px solid #fca5a5; } .btn-danger:hover { background: #fef2f2; }
+  th { text-align: left; font-weight: 600; font-size: .75rem; color: #475569; padding: .6rem .75rem; background: #f8fafc; white-space: nowrap; }
+  td { padding: .6rem .75rem; font-size: .875rem; border-top: 1px solid #e2e8f0; vertical-align: top; }
+  tr[data-act] { cursor: pointer; } tr[data-act]:hover td { background: #f8fafc; }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+
+<body class="bg-slate-100 text-slate-900 font-sans min-h-screen">
+<div id="app"></div>
+
+<!-- Fenêtre modale unique -->
+<div id="modal" class="fixed inset-0 z-50 hidden bg-slate-900/50 overflow-y-auto" role="dialog" aria-modal="true">
+  <div class="min-h-full flex items-start justify-center p-3 sm:p-6">
+    <div id="modal-body" class="bg-white rounded-lg shadow-xl w-full max-w-4xl my-4"></div>
+  </div>
+</div>
+<div id="toasts" class="fixed bottom-4 right-4 z-[60] space-y-2"></div>
+
+<script>
+/* =====================================================================
+   1. CONFIGURATION  —  À MODIFIER
+   ===================================================================== */
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyA7wtjmpkzonRj2yfVtkOQQz26e7fZdF-8",
+  authDomain:        "suivi-esp-mane.firebaseapp.com",
+  projectId:         "suivi-esp-mane",
+  storageBucket:     "suivi-esp-mane.firebasestorage.app",
+  messagingSenderId: "759746255099",
+  appId:             "1:759746255099:web:529773c0ae24a2d556f85e",
+  measurementId:     "G-GRQ91VJJFN"
+};
+// true  = téléversement de fichiers dans Firebase Storage (nécessite l'activation de Storage / plan Blaze)
+// false = pièces jointes sous forme de liens sécurisés (SharePoint, Drive, GED interne…)
+const ENABLE_FILE_UPLOAD = false;
+// true = connexion anonyme Firebase Auth (permet des règles Firestore "request.auth != null")
+const USE_ANON_AUTH = true;
+// Mot de passe initial du compte "admin" (créé automatiquement à la première connexion)
+const ADMIN_DEFAULT_PASSWORD = "totototo";
+
+/* =====================================================================
+   2. RÉFÉRENTIELS MÉTIER
+   ===================================================================== */
+const PERMS = [
+  { key: 'view_esp',         label: 'Voir les ESP' },
+  { key: 'edit_esp',         label: 'Ajouter / Modifier un ESP' },
+  { key: 'delete_esp',       label: 'Supprimer un ESP' },
+  { key: 'enter_control',    label: 'Saisir un rapport de contrôle' },
+  { key: 'validate_control', label: 'Valider / Clôturer un contrôle' },
+  { key: 'view_audit',       label: "Consulter le journal d'audit" },
+  { key: 'manage_users',     label: 'Gérer les utilisateurs' }
+];
+const ESP_TYPES   = ['Récipient (gaz/vapeur)', 'Échangeur', 'Réacteur', 'Tuyauterie', 'Accessoire de sécurité', 'Autre'];
+const CATEGORIES  = ['Art. 4§3 (SEP)', 'I', 'II', 'III', 'IV'];
+const ATEX_ZONES  = ['Hors zone', 'Zone 1', 'Zone 2', 'Zone 21', 'Zone 22'];
+const STATUSES    = ['En service', 'À l\'arrêt / Consigné', 'Isolé', 'Hors service / Rébuté'];
+const OUT_STATUS  = 'Hors service / Rébuté';               // exclu du suivi des échéances
+const CTRL_TYPES  = ['Visite périodique', 'Requalification périodique', 'Contrôle après intervention notable'];
+const CTRL_STATUS = ['Planifié', 'Réalisé', 'Clôturé'];
+const RESULTS     = ['Conforme', 'Conforme avec réserves', 'Non conforme'];
+// Périodicités indicatives en mois [visite/inspection, requalification].
+// À VALIDER selon l'arrêté du 20/11/2017 et le plan d'inspection de l'établissement ; modifiables par équipement.
+const DEFAULT_PERIODS = {
+  'Récipient (gaz/vapeur)': [48, 120], 'Échangeur': [48, 120], 'Réacteur': [48, 120],
+  'Tuyauterie': [72, 144], 'Accessoire de sécurité': [48, 120], 'Autre': [48, 120]
+};
+const FL = { // libellés des champs pour le journal d'audit
+  tag: 'N° inventaire / Tag', serial: 'N° de série', manufacturer: 'Fabricant', year: 'Année de construction',
+  category: 'Catégorie DESP', type: 'Type', fluid: 'Fluide', fluidGroup: 'Groupe de fluide', ps: 'PS (bar)',
+  volume: 'Volume (L)', dn: 'DN', atex: 'Zone ATEX', status: 'Statut', building: 'Bâtiment', workshop: 'Atelier',
+  location: 'Localisation précise', commissioningDate: 'Mise en service', ipMonths: 'Périodicité visite (mois)',
+  rpMonths: 'Périodicité requalif. (mois)', notes: 'Remarques',
+  espId: 'Équipement', plannedDate: 'Date planifiée', doneDate: 'Date de réalisation', inspector: 'Organisme / inspecteur',
+  result: 'Résultat', comment: 'Commentaire', attachments: 'Pièces jointes', validatedBy: 'Validé par', validatedAt: 'Validé le',
+  displayName: 'Nom affiché', active: 'Compte actif', permissions: 'Permissions', password: 'Mot de passe'
+};
+
+/* =====================================================================
+   3. UTILITAIRES
+   ===================================================================== */
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const pad = n => String(n).padStart(2, '0');
+const toISO = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const todayISO = () => toISO(new Date());
+const fmtDate = s => { if (!s) return '—'; const [y, m, d] = s.split('-'); return `${d}/${m}/${y}`; };
+const fmtTs = t => { const d = t?.toDate ? t.toDate() : new Date(); return d.toLocaleString('fr-FR'); };
+function addMonths(iso, m) {
+  const d = new Date(iso + 'T00:00:00'); const day = d.getDate();
+  d.setMonth(d.getMonth() + m); if (d.getDate() !== day) d.setDate(0);
+  return toISO(d);
+}
+function daysUntil(iso) {
+  const a = new Date(iso + 'T00:00:00'), b = new Date(); b.setHours(0, 0, 0, 0);
+  return Math.round((a - b) / 86400000);
+}
+const num = v => (v === '' || v == null || isNaN(+v)) ? null : +v;
+const isHttp = u => /^https?:\/\//i.test(u);
+
+function toast(msg, kind = 'ok') {
+  const c = { ok: 'bg-emerald-700', err: 'bg-red-700', info: 'bg-slate-800' }[kind];
+  const el = document.createElement('div');
+  el.className = `${c} text-white text-sm rounded-md px-4 py-2 shadow-lg max-w-xs`;
+  el.textContent = msg; $('#toasts').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+/* Hachage de mot de passe : PBKDF2-SHA256, 100 000 itérations, sel aléatoire par utilisateur */
+const hex = buf => [...new Uint8Array(buf)].map(b => pad(b.toString(16))).join('');
+const newSalt = () => hex(crypto.getRandomValues(new Uint8Array(16)));
+async function hashPw(pw, salt) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(pw), 'PBKDF2', false, ['deriveBits']);
+  return hex(await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' }, key, 256));
+}
+
+/* =====================================================================
+   4. ÉTAT GLOBAL & FIREBASE
+   ===================================================================== */
+const state = { user: null, esp: [], controls: [], audit: [], users: [], route: 'dashboard',
+  fEsp: { q: '', status: '', atex: '', due: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' };
+let db, auth, storage, FV; const unsubs = []; let charts = [];
+const app = $('#app');
+
+function initFirebase() {
+  firebase.initializeApp(FIREBASE_CONFIG);
+  db = firebase.firestore(); FV = firebase.firestore.FieldValue; auth = firebase.auth();
+  if (ENABLE_FILE_UPLOAD) storage = firebase.storage();
+}
+const can = p => !!state.user && (state.user.role === 'admin' || !!state.user.permissions?.[p]);
+const espById = id => state.esp.find(e => e.id === id);
+
+/* =====================================================================
+   5. CALCUL DES ÉCHÉANCES RÉGLEMENTAIRES
+   - Une requalification périodique (RP) inclut l'inspection : elle remet aussi à zéro la visite périodique.
+   - Un contrôle "Non conforme" ne remet pas les compteurs à zéro.
+   - Sans contrôle enregistré, la base est la date de mise en service (ou le 1er janvier de l'année de construction).
+   ===================================================================== */
+function dueOf(e) {
+  const done = state.controls.filter(c => c.espId === e.id && ['Réalisé', 'Clôturé'].includes(c.status) && c.doneDate && c.result !== 'Non conforme');
+  const last = t => done.filter(c => c.type === t).map(c => c.doneDate).sort().pop() || null;
+  const lastRP = last('Requalification périodique');
+  let lastIP = last('Visite périodique');
+  if (lastRP && (!lastIP || lastRP > lastIP)) lastIP = lastRP;
+  const base = e.commissioningDate || (e.year ? `${e.year}-01-01` : null);
+  const ipDue = (lastIP || base) && e.ipMonths > 0 ? addMonths(lastIP || base, +e.ipMonths) : null;
+  const rpDue = (lastRP || base) && e.rpMonths > 0 ? addMonths(lastRP || base, +e.rpMonths) : null;
+  const next = [ipDue, rpDue].filter(Boolean).sort()[0] || null;
+  const nextType = next ? (next === ipDue ? 'Visite périodique' : 'Requalification périodique') : null;
+  return { lastIP, lastRP, ipDue, rpDue, next, nextType, days: next ? daysUntil(next) : null, monitored: e.status !== OUT_STATUS };
+}
+const BADGE = {
+  red: 'bg-red-100 text-red-800 ring-red-300', orange: 'bg-orange-100 text-orange-800 ring-orange-300',
+  yellow: 'bg-yellow-100 text-yellow-800 ring-yellow-300', green: 'bg-emerald-100 text-emerald-800 ring-emerald-300',
+  gray: 'bg-slate-100 text-slate-600 ring-slate-300', blue: 'bg-sky-100 text-sky-800 ring-sky-300'
+};
+const badge = (t, c) => `<span class="inline-block whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${BADGE[c]}">${esc(t)}</span>`;
+function dueBadge(d) {
+  if (!d.monitored) return badge('Hors périmètre', 'gray');
+  if (d.days === null) return badge('Sans échéance', 'gray');
+  if (d.days < 0) return badge(`Échu depuis ${-d.days} j`, 'red');
+  if (d.days <= 30) return badge(`Dans ${d.days} j`, 'orange');
+  if (d.days <= 90) return badge(`Dans ${d.days} j`, 'yellow');
+  return badge('Conforme', 'green');
+}
+const dueClass = d => !d.monitored || d.days === null ? 'gray' : d.days < 0 ? 'red' : d.days <= 30 ? 'orange' : d.days <= 90 ? 'yellow' : 'green';
+
+/* =====================================================================
+   6. ÉCRITURE + JOURNAL D'AUDIT (traçabilité)
+   ===================================================================== */
+const normV = v => {
+  if (v == null || v === '') return '';
+  if (Array.isArray(v)) return v.map(a => a.name).join(', ');
+  if (typeof v === 'object') return Object.entries(v).filter(([, x]) => x).map(([k]) => (PERMS.find(p => p.key === k) || {}).label || k).join(', ');
+  return String(v);
+};
+function diff(before, after) {
+  const out = [];
+  Object.keys(after).forEach(k => {
+    const o = normV(before?.[k]), n = normV(after[k]);
+    if (o !== n) out.push({ field: FL[k] || k, old: o.slice(0, 200), new: n.slice(0, 200) });
+  });
+  return out;
+}
+function auditEntry(o) {
+  return { ts: FV.serverTimestamp(), user: state.user.username, action: o.action, entity: o.entity,
+           entityId: o.entityId, label: o.label, espId: o.espId || '', changes: o.changes || [] };
+}
+/* Enregistre (création ou modification) + écrit l'entrée d'audit dans un même batch atomique */
+async function saveWithAudit({ col, id, data, before, entity, label, espId }) {
+  const changes = diff(before, data);
+  if (before && !changes.length) return false;
+  const batch = db.batch();
+  const meta = { updatedAt: FV.serverTimestamp(), updatedBy: state.user.username };
+  if (!before) { meta.createdAt = FV.serverTimestamp(); meta.createdBy = state.user.username; }
+  batch.set(db.collection(col).doc(id), { ...data, ...meta }, { merge: true });
+  batch.set(db.collection('audit').doc(), auditEntry({ action: before ? 'Modification' : 'Création', entity, entityId: id, label, espId, changes }));
+  await batch.commit(); return true;
+}
+async function deleteWithAudit({ col, id, entity, label, espId, changes = [], alsoDelete = [] }) {
+  const batch = db.batch();
+  batch.delete(db.collection(col).doc(id));
+  alsoDelete.forEach(r => batch.delete(db.collection(r.col).doc(r.id)));
+  batch.set(db.collection('audit').doc(), auditEntry({ action: 'Suppression', entity, entityId: id, label, espId, changes }));
+  await batch.commit();
+}
+
+/* =====================================================================
+   7. AUTHENTIFICATION (utilisateurs stockés dans Firestore)
+   ===================================================================== */
+async function login(username, pw) {
+  username = username.trim().toLowerCase();
+  const snap = await db.collection('users').doc(username).get();
+  if (!snap.exists) {
+    // Amorçage : création du compte admin par défaut à la première connexion
+    if (username === 'admin' && pw === ADMIN_DEFAULT_PASSWORD) {
+      const salt = newSalt();
+      const u = { username: 'admin', displayName: 'Administrateur', role: 'admin', salt, hash: await hashPw(pw, salt), active: true, permissions: {} };
+      await db.collection('users').doc('admin').set({ ...u, createdAt: FV.serverTimestamp() });
+      return u;
+    }
+    throw new Error('Identifiant ou mot de passe incorrect.');
+  }
+  const u = snap.data();
+  if (u.active === false) throw new Error('Ce compte est désactivé. Contactez un administrateur.');
+  if (await hashPw(pw, u.salt) !== u.hash) throw new Error('Identifiant ou mot de passe incorrect.');
+  return u;
+}
+function startSession(u) {
+  state.user = u; sessionStorage.setItem('esp_user', u.username);
+  startListeners(); renderShell();
+}
+function logout() {
+  unsubs.splice(0).forEach(f => f()); sessionStorage.removeItem('esp_user');
+  Object.assign(state, { user: null, esp: [], controls: [], audit: [], users: [] });
+  closeModal(); renderLogin();
+}
+function startListeners() {
+  unsubs.splice(0).forEach(f => f());
+  const err = e => { console.error(e); toast('Erreur Firestore : ' + e.message, 'err'); };
+  const list = s => s.docs.map(d => ({ id: d.id, ...d.data() }));
+  // Le profil courant est surveillé : changement de droits ou désactivation pris en compte en direct
+  unsubs.push(db.collection('users').doc(state.user.username).onSnapshot(s => {
+    if (!s.exists || s.data().active === false) { toast('Session terminée : compte supprimé ou désactivé.', 'err'); return logout(); }
+    const prev = JSON.stringify(state.user.permissions);
+    state.user = s.data();
+    if (prev !== JSON.stringify(state.user.permissions)) setTimeout(() => { startListeners(); renderShell(); }, 0);
+  }, err));
+  unsubs.push(db.collection('esp').onSnapshot(s => { state.esp = list(s); renderView(); }, err));
+  unsubs.push(db.collection('controls').onSnapshot(s => { state.controls = list(s); renderView(); }, err));
+  if (can('view_audit'))
+    unsubs.push(db.collection('audit').orderBy('ts', 'desc').limit(300).onSnapshot(s => { state.audit = list(s); if (state.route === 'audit') renderView(); }, err));
+  if (can('manage_users'))
+    unsubs.push(db.collection('users').onSnapshot(s => { state.users = list(s); if (state.route === 'users') renderView(); }, err));
+}
+
+/* =====================================================================
+   8. ÉCRANS : CONNEXION & COQUILLE
+   ===================================================================== */
+function renderLogin(msg = '') {
+  app.innerHTML = `
+  <div class="min-h-screen grid lg:grid-cols-2">
+    <div class="hidden lg:flex flex-col justify-between bg-[#12303d] text-white p-12">
+      <div class="text-sm font-medium tracking-wide text-sky-200">Usine arômes &amp; parfums</div>
+      <div>
+        <h1 class="text-4xl font-semibold leading-tight max-w-md">Équipements sous pression : chaque échéance, chaque rapport, chaque modification tracée.</h1>
+        <p class="mt-5 text-sky-100/80 max-w-md text-sm leading-relaxed">Suivi des visites et requalifications périodiques, alignées sur l'arrêté du 20 novembre 2017, avec les zones ATEX et le statut d'installation de chaque appareil.</p>
+      </div>
+      <div class="flex gap-2 text-xs">
+        <span class="rounded bg-red-500/90 px-2 py-1">Échu</span><span class="rounded bg-orange-500/90 px-2 py-1">&lt; 30 jours</span>
+        <span class="rounded bg-yellow-500/90 px-2 py-1 text-slate-900">&lt; 90 jours</span><span class="rounded bg-emerald-500/90 px-2 py-1">Conforme</span>
+      </div>
+    </div>
+    <div class="flex items-center justify-center p-6">
+      <form data-form="login" class="w-full max-w-sm bg-white rounded-lg shadow p-7 space-y-4">
+        <div><h2 class="text-xl font-semibold">Connexion</h2><p class="text-sm text-slate-500">ESP Manager</p></div>
+        ${msg ? `<div class="rounded-md bg-red-50 text-red-800 text-sm p-3" role="alert">${esc(msg)}</div>` : ''}
+        <label class="block text-sm font-medium">Identifiant<input name="username" class="fld" autocomplete="username" required autofocus></label>
+        <label class="block text-sm font-medium">Mot de passe<input name="password" type="password" class="fld" autocomplete="current-password" required></label>
+        <button class="btn btn-primary w-full justify-center" type="submit">Se connecter</button>
+      </form>
+    </div>
+  </div>`;
+}
+function configMissing() {
+  app.innerHTML = `<div class="min-h-screen flex items-center justify-center p-6"><div class="max-w-lg bg-white rounded-lg shadow p-7">
+  <h1 class="text-xl font-semibold">Configuration Firebase manquante</h1>
+  <p class="mt-3 text-sm text-slate-600">Ouvrez <code class="bg-slate-100 px-1 rounded">index.html</code>, repérez la constante <code class="bg-slate-100 px-1 rounded">FIREBASE_CONFIG</code> (section 1) et remplacez les valeurs par celles de votre projet Firebase. Les étapes détaillées figurent dans le fichier README.md.</p></div></div>`;
+}
+
+const ROUTES = {
+  dashboard: { label: 'Tableau de bord', perm: 'view_esp', view: viewDashboard },
+  esp:       { label: 'Équipements',     perm: 'view_esp', view: viewEsp },
+  controls:  { label: 'Contrôles',       perm: 'view_esp', view: viewControls },
+  audit:     { label: "Journal d'audit", perm: 'view_audit', view: viewAudit },
+  users:     { label: 'Utilisateurs',    perm: 'manage_users', view: viewUsers }
+};
+function allowedRoutes() { return Object.keys(ROUTES).filter(k => can(ROUTES[k].perm)); }
+
+function renderShell() {
+  if (!state.user) return;
+  const allowed = allowedRoutes();
+  let r = (location.hash || '').slice(1);
+  if (!allowed.includes(r)) r = allowed[0] || '';         // redirection selon les permissions
+  state.route = r;
+  app.innerHTML = `
+  <header class="bg-[#12303d] text-white">
+    <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
+      <div class="font-semibold">ESP Manager</div>
+      <div class="flex items-center gap-3 text-sm">
+        <span class="hidden sm:inline text-sky-100">${esc(state.user.displayName || state.user.username)}${state.user.role === 'admin' ? ' · admin' : ''}</span>
+        <button class="btn bg-white/10 hover:bg-white/20 text-white" data-act="pwd">Mon mot de passe</button>
+        <button class="btn bg-white/10 hover:bg-white/20 text-white" data-act="logout">Déconnexion</button>
+      </div>
+    </div>
+    <nav class="max-w-7xl mx-auto px-4 flex gap-1 overflow-x-auto" aria-label="Navigation principale">
+      ${allowed.map(k => `<a href="#${k}" class="px-4 py-2 text-sm whitespace-nowrap border-b-2 ${k === r ? 'border-sky-300 text-white font-medium' : 'border-transparent text-sky-100/80 hover:text-white'}">${ROUTES[k].label}</a>`).join('')}
+    </nav>
+  </header>
+  <main id="view" class="max-w-7xl mx-auto p-4 sm:p-6"></main>`;
+  renderView();
+}
+function renderView() {
+  const v = $('#view'); if (!v || !state.user) return;
+  charts.forEach(c => c.destroy()); charts = [];
+  if (!state.route) { v.innerHTML = `<div class="bg-white rounded-lg shadow p-8 text-center"><h2 class="font-semibold">Aucun accès attribué</h2><p class="text-sm text-slate-600 mt-2">Votre compte n'a encore aucun droit. Demandez à un administrateur de cocher vos permissions.</p></div>`; return; }
+  v.innerHTML = ROUTES[state.route].view();
+  if (state.route === 'dashboard') drawCharts();
+}
+window.addEventListener('hashchange', renderShell);
+
+/* =====================================================================
+   9. TABLEAU DE BORD
+   ===================================================================== */
+function viewDashboard() {
+  const rows = state.esp.map(e => ({ e, d: dueOf(e) })), mon = rows.filter(x => x.d.monitored);
+  const within = n => mon.filter(x => x.d.days !== null && x.d.days >= 0 && x.d.days <= n).length;
+  const overdue = mon.filter(x => x.d.days !== null && x.d.days < 0).length;
+  const card = (label, val, c, hint) => `<div class="bg-white rounded-lg shadow-sm border-l-4 ${c} p-4"><div class="text-3xl font-semibold">${val}</div><div class="text-sm font-medium mt-1">${label}</div><div class="text-xs text-slate-500">${hint}</div></div>`;
+  const top = mon.filter(x => x.d.next).sort((a, b) => a.d.next.localeCompare(b.d.next)).slice(0, 10);
+  return `
+  <h1 class="text-xl font-semibold mb-4">Tableau de bord</h1>
+  <div class="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
+    ${card('ESP au parc', state.esp.length, 'border-slate-400', 'tous statuts confondus')}
+    ${card('En service', state.esp.filter(e => e.status === 'En service').length, 'border-emerald-500', 'statut « En service »')}
+    ${card('En retard', overdue, 'border-red-600', 'échéance dépassée')}
+    ${card('À 30 jours', within(30), 'border-orange-500', 'échéances ≤ 30 j')}
+    ${card('À 60 jours', within(60), 'border-yellow-500', 'échéances ≤ 60 j')}
+    ${card('À 90 jours', within(90), 'border-sky-500', 'échéances ≤ 90 j')}
+  </div>
+  <p class="text-xs text-slate-500 mt-2">Les équipements « Hors service / Rébuté » sont exclus du suivi. Les compteurs d'échéance sont cumulatifs (≤ 90 j inclut ≤ 30 j).</p>
+  <div class="grid lg:grid-cols-3 gap-4 mt-5">
+    ${['Répartition par type', 'Répartition par zone ATEX', 'Répartition par statut'].map((t, i) => `
+      <div class="bg-white rounded-lg shadow-sm p-4"><h2 class="text-sm font-semibold mb-2">${t}</h2><div class="relative h-56"><canvas id="ch${i}"></canvas></div></div>`).join('')}
+  </div>
+  <div class="bg-white rounded-lg shadow-sm mt-5 overflow-x-auto">
+    <h2 class="text-sm font-semibold p-4 pb-2">Échéances prioritaires</h2>
+    <table class="w-full min-w-[640px]"><thead><tr><th>Tag</th><th>Type</th><th>Prochain contrôle</th><th>Échéance</th><th>État</th></tr></thead><tbody>
+    ${top.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}"><td class="font-medium">${esc(e.tag)}</td><td>${esc(e.type)}</td><td>${esc(d.nextType)}</td><td>${fmtDate(d.next)}</td><td>${dueBadge(d)}</td></tr>`).join('')
+      || `<tr><td colspan="5" class="text-slate-500">Aucun équipement suivi. Ajoutez un ESP depuis l'onglet Équipements.</td></tr>`}
+    </tbody></table></div>`;
+}
+function drawCharts() {
+  if (!window.Chart) return;
+  const pal = ['#0e6a8a', '#d97706', '#4d7c0f', '#9333ea', '#be123c', '#64748b'];
+  const count = (f, order) => { const m = {}; state.esp.forEach(e => { const k = f(e) || 'Non renseigné'; m[k] = (m[k] || 0) + 1; }); const ks = order ? order.filter(k => m[k]) .concat(Object.keys(m).filter(k => !order.includes(k))) : Object.keys(m); return { labels: ks, data: ks.map(k => m[k]) }; };
+  const mk = (id, type, o) => { const c = $('#' + id); if (!c) return;
+    charts.push(new Chart(c, { type, data: { labels: o.labels, datasets: [{ data: o.data, backgroundColor: pal, borderWidth: 1 }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: type === 'doughnut', position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } } },
+        scales: type === 'bar' ? { y: { beginAtZero: true, ticks: { precision: 0 } } } : {} } })); };
+  mk('ch0', 'doughnut', count(e => e.type));
+  mk('ch1', 'bar', count(e => e.atex, ATEX_ZONES));
+  mk('ch2', 'doughnut', count(e => e.status, STATUSES));
+}
+
+/* =====================================================================
+   10. ÉQUIPEMENTS : LISTE
+   ===================================================================== */
+const opt = (arr, sel, blank) => (blank != null ? `<option value="">${blank}</option>` : '') + arr.map(x => `<option ${x === sel ? 'selected' : ''}>${esc(x)}</option>`).join('');
+function viewEsp() {
+  const f = state.fEsp;
+  return `
+  <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+    <h1 class="text-xl font-semibold">Équipements sous pression</h1>
+    <div class="flex gap-2">
+      <button class="btn btn-ghost" data-act="export-csv">Exporter en CSV</button>
+      ${can('edit_esp') ? `<button class="btn btn-primary" data-act="esp-new">Ajouter un ESP</button>` : ''}
+    </div>
+  </div>
+  <div class="bg-white rounded-lg shadow-sm p-3 grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
+    <input class="fld !mt-0" placeholder="Rechercher (tag, série, fluide, lieu…)" value="${esc(f.q)}" data-filter="fEsp.q">
+    <select class="fld !mt-0" data-filter="fEsp.status">${opt(STATUSES, f.status, 'Tous les statuts')}</select>
+    <select class="fld !mt-0" data-filter="fEsp.atex">${opt(ATEX_ZONES, f.atex, 'Toutes les zones ATEX')}</select>
+    <select class="fld !mt-0" data-filter="fEsp.due">${opt(['Échu', '≤ 30 jours', '≤ 90 jours', 'Conforme'], f.due, 'Toutes les échéances')}</select>
+  </div>
+  <div id="esp-table" class="bg-white rounded-lg shadow-sm mt-3 overflow-x-auto">${espTable()}</div>`;
+}
+function filteredEsp() {
+  const f = state.fEsp, q = f.q.toLowerCase();
+  return state.esp.map(e => ({ e, d: dueOf(e) })).filter(({ e, d }) => {
+    if (q && !`${e.tag} ${e.serial} ${e.fluid} ${e.manufacturer} ${e.building} ${e.workshop} ${e.location}`.toLowerCase().includes(q)) return false;
+    if (f.status && e.status !== f.status) return false;
+    if (f.atex && e.atex !== f.atex) return false;
+    if (f.due) {
+      if (!d.monitored || d.days === null) return false;
+      if (f.due === 'Échu' && !(d.days < 0)) return false;
+      if (f.due === '≤ 30 jours' && !(d.days >= 0 && d.days <= 30)) return false;
+      if (f.due === '≤ 90 jours' && !(d.days >= 0 && d.days <= 90)) return false;
+      if (f.due === 'Conforme' && !(d.days > 90)) return false;
+    }
+    return true;
+  }).sort((a, b) => (a.d.next || '9999').localeCompare(b.d.next || '9999'));
+}
+function espTable() {
+  const rows = filteredEsp();
+  return `<table class="w-full min-w-[900px]"><thead><tr><th>Tag</th><th>Type</th><th>Cat.</th><th>Fluide</th><th>Zone ATEX</th><th>Statut</th><th>Localisation</th><th>Prochaine échéance</th><th>État</th></tr></thead><tbody>
+  ${rows.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}">
+    <td class="font-medium">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.serial)}</div></td>
+    <td>${esc(e.type)}</td><td>${esc(e.category)}</td><td>${esc(e.fluid)}</td>
+    <td>${e.atex && e.atex !== 'Hors zone' ? badge(e.atex, 'blue') : '<span class="text-slate-500">Hors zone</span>'}</td>
+    <td>${esc(e.status)}</td><td>${esc([e.building, e.workshop].filter(Boolean).join(' / '))}</td>
+    <td>${d.next ? `${fmtDate(d.next)}<div class="text-xs text-slate-500">${esc(d.nextType)}</div>` : '—'}</td><td>${dueBadge(d)}</td></tr>`).join('')
+    || `<tr><td colspan="9" class="text-slate-500">Aucun équipement ne correspond à ces critères.</td></tr>`}
+  </tbody></table><div class="px-3 py-2 text-xs text-slate-500 border-t">${rows.length} équipement(s)</div>`;
+}
+function exportCsv() {
+  const cols = ['tag', 'serial', 'manufacturer', 'year', 'category', 'type', 'fluid', 'fluidGroup', 'ps', 'volume', 'dn', 'atex', 'status', 'building', 'workshop', 'location', 'commissioningDate'];
+  const head = cols.map(c => FL[c]).concat(['Prochaine échéance', 'Type échéance']);
+  const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const lines = filteredEsp().map(({ e, d }) => cols.map(c => q(e[c])).concat([q(d.next), q(d.nextType)]).join(';'));
+  const blob = new Blob(['\ufeff' + [head.map(q).join(';'), ...lines].join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `esp_${todayISO()}.csv`; a.click();
+}
+
+/* =====================================================================
+   11. ÉQUIPEMENTS : FICHE (formulaire + contrôles + historique)
+   ===================================================================== */
+const inp = (name, label, val = '', o = {}) => `<label class="block text-sm font-medium ${o.span || ''}">${label}${o.req ? ' *' : ''}
+  <input class="fld" name="${name}" type="${o.type || 'text'}" value="${esc(val)}" ${o.req ? 'required' : ''} ${o.attr || ''}></label>`;
+const sel = (name, label, arr, val, o = {}) => `<label class="block text-sm font-medium ${o.span || ''}">${label}${o.req ? ' *' : ''}
+  <select class="fld" name="${name}" ${o.req ? 'required' : ''}>${opt(arr, val, o.blank === false ? null : '—')}</select></label>`;
+
+function openEsp(id) {
+  const e = id ? espById(id) : { status: 'En service', atex: 'Hors zone', ipMonths: 48, rpMonths: 120 };
+  if (id && !e) return;
+  const ro = !can('edit_esp'), d = id ? dueOf(e) : null;
+  const ctrls = id ? state.controls.filter(c => c.espId === id).sort((a, b) => (b.doneDate || b.plannedDate || '').localeCompare(a.doneDate || a.plannedDate || '')) : [];
+  openModal(`
+  <div class="flex items-center justify-between p-4 border-b">
+    <h2 class="text-lg font-semibold">${id ? `ESP ${esc(e.tag)}` : 'Nouvel équipement sous pression'}</h2>
+    <button class="btn btn-ghost" data-act="close" aria-label="Fermer">Fermer</button>
+  </div>
+  <form data-form="esp" data-id="${id || ''}" class="p-4">
+    <fieldset ${ro ? 'disabled' : ''} class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+      ${inp('tag', 'N° inventaire / Tag interne', e.tag, { req: 1 })}
+      ${inp('serial', 'N° de série', e.serial)}
+      ${inp('manufacturer', 'Fabricant', e.manufacturer)}
+      ${inp('year', 'Année de construction', e.year, { type: 'number', attr: 'min="1900" max="2100"' })}
+      ${sel('category', 'Catégorie DESP / PED', CATEGORIES, e.category)}
+      ${sel('type', "Type d'équipement", ESP_TYPES, e.type, { req: 1 })}
+      ${inp('fluid', 'Fluide contenu', e.fluid)}
+      ${sel('fluidGroup', 'Groupe de fluide', ['1', '2'], e.fluidGroup)}
+      ${inp('ps', 'Pression de service PS (bar)', e.ps, { type: 'number', attr: 'step="any" min="0"' })}
+      ${inp('volume', 'Volume V (L)', e.volume, { type: 'number', attr: 'step="any" min="0"' })}
+      ${inp('dn', 'DN (tuyauterie)', e.dn, { type: 'number', attr: 'step="any" min="0"' })}
+      ${sel('atex', 'Zone ATEX', ATEX_ZONES, e.atex, { req: 1, blank: false })}
+      ${sel('status', "Statut de l'installation", STATUSES, e.status, { req: 1, blank: false })}
+      ${inp('building', 'Bâtiment', e.building)}
+      ${inp('workshop', 'Atelier', e.workshop)}
+      ${inp('location', 'Localisation précise', e.location, { span: 'sm:col-span-2 lg:col-span-2' })}
+      ${inp('commissioningDate', 'Date de mise en service', e.commissioningDate, { type: 'date' })}
+      ${inp('ipMonths', 'Périodicité visite périodique (mois)', e.ipMonths, { type: 'number', attr: 'min="0"' })}
+      ${inp('rpMonths', 'Périodicité requalification (mois)', e.rpMonths, { type: 'number', attr: 'min="0"' })}
+      <label class="block text-sm font-medium sm:col-span-2 lg:col-span-3">Remarques<textarea class="fld" name="notes" rows="2">${esc(e.notes)}</textarea></label>
+    </fieldset>
+    <p class="text-xs text-slate-500 mt-2">Les périodicités proposées sont indicatives : alignez-les sur l'arrêté du 20/11/2017 et sur votre plan d'inspection.</p>
+    ${id ? `<div class="mt-4 rounded-md bg-slate-50 border p-3 text-sm grid sm:grid-cols-4 gap-2">
+      <div><div class="text-xs text-slate-500">Dernière visite</div>${fmtDate(d.lastIP)}</div>
+      <div><div class="text-xs text-slate-500">Dernière requalification</div>${fmtDate(d.lastRP)}</div>
+      <div><div class="text-xs text-slate-500">Prochaine visite</div>${fmtDate(d.ipDue)}</div>
+      <div><div class="text-xs text-slate-500">Prochaine requalification</div>${fmtDate(d.rpDue)}</div>
+    </div>` : ''}
+    <div class="flex flex-wrap gap-2 mt-4">
+      ${!ro ? `<button class="btn btn-primary" type="submit">Enregistrer</button>` : ''}
+      ${id && can('delete_esp') ? `<button class="btn btn-danger" type="button" data-act="esp-delete" data-id="${id}">Supprimer l'ESP</button>` : ''}
+    </div>
+  </form>
+  ${id ? `
+  <div class="p-4 border-t">
+    <div class="flex items-center justify-between mb-2"><h3 class="font-semibold text-sm">Contrôles réglementaires (${ctrls.length})</h3>
+      ${can('enter_control') ? `<button class="btn btn-ghost" data-act="ctrl-new" data-esp="${id}">Ajouter un contrôle</button>` : ''}</div>
+    <div class="overflow-x-auto border rounded-md"><table class="w-full min-w-[560px]"><thead><tr><th>Type</th><th>Statut</th><th>Date</th><th>Résultat</th><th>Pièces</th></tr></thead><tbody>
+    ${ctrls.map(c => `<tr data-act="ctrl-open" data-id="${c.id}"><td>${esc(c.type)}</td><td>${ctrlStatusBadge(c.status)}</td><td>${fmtDate(c.doneDate || c.plannedDate)}</td><td>${resultBadge(c.result)}</td><td>${(c.attachments || []).length}</td></tr>`).join('')
+      || `<tr><td colspan="5" class="text-slate-500">Aucun contrôle enregistré.</td></tr>`}</tbody></table></div>
+  </div>
+  ${can('view_audit') ? `<div class="p-4 border-t"><h3 class="font-semibold text-sm mb-2">Historique des modifications</h3><div id="esp-history" class="text-sm text-slate-500">Chargement…</div></div>` : ''}` : ''}`);
+  if (id && can('view_audit')) loadHistory(id);
+  // Suggestion automatique des périodicités selon le type (uniquement à la création)
+  if (!id) $('[name=type]').addEventListener('change', ev => {
+    const p = DEFAULT_PERIODS[ev.target.value]; if (p) { $('[name=ipMonths]').value = p[0]; $('[name=rpMonths]').value = p[1]; }
+  });
+}
+async function loadHistory(espId) {
+  try {
+    const s = await db.collection('audit').where('espId', '==', espId).get();   // tri côté client : pas d'index composite requis
+    const rows = s.docs.map(d => d.data()).sort((a, b) => (b.ts?.seconds || 9e9) - (a.ts?.seconds || 9e9));
+    const box = $('#esp-history'); if (!box) return;
+    box.innerHTML = rows.length ? auditTable(rows, true) : 'Aucune entrée.';
+  } catch (e) { const b = $('#esp-history'); if (b) b.textContent = 'Historique indisponible : ' + e.message; }
+}
+
+/* =====================================================================
+   12. CONTRÔLES : LISTE & FORMULAIRE
+   ===================================================================== */
+const ctrlStatusBadge = s => badge(s || '—', { 'Planifié': 'blue', 'Réalisé': 'yellow', 'Clôturé': 'green' }[s] || 'gray');
+const resultBadge = r => r ? badge(r, { 'Conforme': 'green', 'Conforme avec réserves': 'orange', 'Non conforme': 'red' }[r]) : '—';
+
+function viewControls() {
+  const f = state.fCtrl;
+  return `
+  <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+    <h1 class="text-xl font-semibold">Contrôles réglementaires</h1>
+    ${can('enter_control') ? `<button class="btn btn-primary" data-act="ctrl-new">Saisir un contrôle</button>` : ''}
+  </div>
+  <div class="bg-white rounded-lg shadow-sm p-3 grid sm:grid-cols-3 gap-3">
+    <input class="fld !mt-0" placeholder="Rechercher (tag, organisme…)" value="${esc(f.q)}" data-filter="fCtrl.q">
+    <select class="fld !mt-0" data-filter="fCtrl.type">${opt(CTRL_TYPES, f.type, 'Tous les types')}</select>
+    <select class="fld !mt-0" data-filter="fCtrl.status">${opt(CTRL_STATUS, f.status, 'Tous les statuts')}</select>
+  </div>
+  <div id="ctrl-table" class="bg-white rounded-lg shadow-sm mt-3 overflow-x-auto">${ctrlTable()}</div>`;
+}
+function ctrlTable() {
+  const f = state.fCtrl, q = f.q.toLowerCase();
+  const rows = state.controls.filter(c => {
+    const e = espById(c.espId);
+    if (q && !`${e?.tag} ${c.inspector} ${c.comment}`.toLowerCase().includes(q)) return false;
+    return (!f.type || c.type === f.type) && (!f.status || c.status === f.status);
+  }).sort((a, b) => (b.doneDate || b.plannedDate || '').localeCompare(a.doneDate || a.plannedDate || ''));
+  return `<table class="w-full min-w-[820px]"><thead><tr><th>ESP</th><th>Type de contrôle</th><th>Statut</th><th>Planifié</th><th>Réalisé</th><th>Organisme</th><th>Résultat</th><th>Pièces</th></tr></thead><tbody>
+  ${rows.map(c => `<tr data-act="ctrl-open" data-id="${c.id}"><td class="font-medium">${esc(espById(c.espId)?.tag || '(supprimé)')}</td><td>${esc(c.type)}</td><td>${ctrlStatusBadge(c.status)}</td>
+    <td>${fmtDate(c.plannedDate)}</td><td>${fmtDate(c.doneDate)}</td><td>${esc(c.inspector)}</td><td>${resultBadge(c.result)}</td><td>${(c.attachments || []).length}</td></tr>`).join('')
+    || `<tr><td colspan="8" class="text-slate-500">Aucun contrôle enregistré.</td></tr>`}</tbody></table>`;
+}
+
+let ctrlAtt = [];   // pièces jointes en cours d'édition
+function attList(ro) {
+  return ctrlAtt.map((a, i) => `<li class="flex items-center justify-between gap-2 py-1">
+    <a class="text-sky-700 underline break-all" href="${esc(a.url)}" target="_blank" rel="noopener noreferrer">${esc(a.name)}</a>
+    <span class="text-xs text-slate-500 whitespace-nowrap">${a.kind === 'file' ? 'Fichier' : 'Lien'}</span>
+    ${ro ? '' : `<button type="button" class="text-red-700 text-xs underline" data-act="att-del" data-i="${i}">Retirer</button>`}</li>`).join('') || '<li class="text-slate-500">Aucune pièce jointe.</li>';
+}
+function openCtrl(id, espId) {
+  const c = id ? state.controls.find(x => x.id === id) : { espId: espId || '', type: CTRL_TYPES[0], status: 'Planifié', plannedDate: todayISO() };
+  if (id && !c) return;
+  const locked = c.status === 'Clôturé' && !can('validate_control');
+  const ro = !can('enter_control') || locked;
+  ctrlAtt = (c.attachments || []).map(a => ({ ...a }));
+  const statuses = CTRL_STATUS.filter(s => s !== 'Clôturé' || can('validate_control') || c.status === 'Clôturé');
+  openModal(`
+  <div class="flex items-center justify-between p-4 border-b">
+    <h2 class="text-lg font-semibold">${id ? 'Contrôle' : 'Nouveau contrôle'}</h2>
+    <button class="btn btn-ghost" data-act="close">Fermer</button>
+  </div>
+  <form data-form="ctrl" data-id="${id || ''}" class="p-4">
+    ${locked ? `<div class="mb-3 rounded-md bg-yellow-50 text-yellow-900 text-sm p-3">Ce contrôle est clôturé. Seul un utilisateur autorisé à valider/clôturer peut le modifier.</div>` : ''}
+    <fieldset ${ro ? 'disabled' : ''} class="grid sm:grid-cols-2 gap-3">
+      <label class="block text-sm font-medium sm:col-span-2">Équipement *
+        <select class="fld" name="espId" required><option value="">— Choisir —</option>
+        ${[...state.esp].sort((a, b) => (a.tag || '').localeCompare(b.tag || '')).map(e => `<option value="${e.id}" ${e.id === c.espId ? 'selected' : ''}>${esc(e.tag)} — ${esc(e.type || '')}</option>`).join('')}</select></label>
+      ${sel('type', 'Type de contrôle', CTRL_TYPES, c.type, { req: 1, blank: false })}
+      ${sel('status', 'Statut', statuses, c.status, { req: 1, blank: false })}
+      ${inp('plannedDate', 'Date planifiée', c.plannedDate, { type: 'date' })}
+      ${inp('doneDate', 'Date de réalisation', c.doneDate, { type: 'date' })}
+      ${inp('inspector', 'Organisme / inspecteur', c.inspector)}
+      ${sel('result', 'Résultat', RESULTS, c.result)}
+      <label class="block text-sm font-medium sm:col-span-2">Commentaire / réserves<textarea class="fld" name="comment" rows="3">${esc(c.comment)}</textarea></label>
+      <div class="sm:col-span-2">
+        <div class="text-sm font-medium">Pièces jointes (rapports, certificats)</div>
+        <ul id="att-list" class="text-sm divide-y border rounded-md px-3 mt-1">${attList(ro)}</ul>
+        ${ro ? '' : `<div class="grid sm:grid-cols-[1fr_2fr_auto] gap-2 mt-2">
+          <input id="att-name" class="fld !mt-0" placeholder="Nom du document">
+          <input id="att-url" class="fld !mt-0" placeholder="https://… lien sécurisé (GED, SharePoint, Drive)">
+          <button type="button" class="btn btn-ghost" data-act="att-add">Ajouter le lien</button></div>
+          ${ENABLE_FILE_UPLOAD ? `<label class="block text-sm mt-2">Ou téléverser des fichiers (PDF, images – 10 Mo max)<input class="fld" type="file" name="files" multiple accept=".pdf,image/*"></label>` : ''}`}
+      </div>
+    </fieldset>
+    ${c.validatedBy ? `<p class="text-xs text-slate-500 mt-2">Clôturé par ${esc(c.validatedBy)} le ${fmtDate(c.validatedAt)}.</p>` : ''}
+    <div class="flex flex-wrap gap-2 mt-4">
+      ${!ro ? `<button class="btn btn-primary" type="submit">Enregistrer</button>` : ''}
+      ${id && can('enter_control') && !locked ? `<button class="btn btn-danger" type="button" data-act="ctrl-delete" data-id="${id}">Supprimer</button>` : ''}
+    </div>
+  </form>`);
+}
+
+/* =====================================================================
+   13. JOURNAL D'AUDIT
+   ===================================================================== */
+function auditTable(rows, compact) {
+  return `<div class="overflow-x-auto ${compact ? 'border rounded-md' : ''}"><table class="w-full min-w-[700px]"><thead><tr><th>Date</th><th>Utilisateur</th><th>Action</th>${compact ? '' : '<th>Objet</th>'}<th>Détail</th></tr></thead><tbody>
+  ${rows.map(a => `<tr><td class="whitespace-nowrap">${fmtTs(a.ts)}</td><td>${esc(a.user)}</td>
+    <td>${badge(a.action, { 'Création': 'green', 'Modification': 'blue', 'Suppression': 'red' }[a.action] || 'gray')}</td>
+    ${compact ? '' : `<td>${esc(a.entity)}<div class="text-xs text-slate-500">${esc(a.label)}</div></td>`}
+    <td>${compact ? `<div class="text-xs text-slate-500">${esc(a.entity)} · ${esc(a.label)}</div>` : ''}${(a.changes || []).slice(0, 12).map(c =>
+      `<div class="text-xs"><span class="font-medium">${esc(c.field)}</span> : <span class="text-red-700 line-through">${esc(c.old || '∅')}</span> → <span class="text-emerald-700">${esc(c.new || '∅')}</span></div>`).join('')}
+      ${(a.changes || []).length > 12 ? `<div class="text-xs text-slate-500">… +${a.changes.length - 12} autre(s)</div>` : ''}</td></tr>`).join('')}
+  </tbody></table></div>`;
+}
+function viewAudit() {
+  return `<h1 class="text-xl font-semibold mb-4">Journal d'audit</h1>
+  <div class="bg-white rounded-lg shadow-sm p-3"><input class="fld !mt-0" placeholder="Filtrer (utilisateur, objet, champ…)" value="${esc(state.fAudit)}" data-filter="fAudit"></div>
+  <div id="audit-table" class="bg-white rounded-lg shadow-sm mt-3">${auditBody()}</div>`;
+}
+function auditBody() {
+  const q = state.fAudit.toLowerCase();
+  const rows = state.audit.filter(a => !q || JSON.stringify(a).toLowerCase().includes(q));
+  return rows.length ? auditTable(rows) + `<div class="px-3 py-2 text-xs text-slate-500 border-t">${rows.length} entrée(s) affichée(s) — les 300 plus récentes.</div>` : '<div class="p-4 text-sm text-slate-500">Aucune entrée.</div>';
+}
+
+/* =====================================================================
+   14. GESTION DES UTILISATEURS (Admin)
+   ===================================================================== */
+function viewUsers() {
+  return `<div class="flex items-center justify-between mb-4"><h1 class="text-xl font-semibold">Utilisateurs</h1>
+    <button class="btn btn-primary" data-act="user-new">Créer un utilisateur</button></div>
+  <div class="bg-white rounded-lg shadow-sm overflow-x-auto"><table class="w-full min-w-[640px]"><thead><tr><th>Identifiant</th><th>Nom</th><th>Statut</th><th>Droits</th></tr></thead><tbody>
+  ${[...state.users].sort((a, b) => a.id.localeCompare(b.id)).map(u => `<tr data-act="user-open" data-id="${u.id}"><td class="font-medium">${esc(u.username)}</td><td>${esc(u.displayName)}</td>
+    <td>${u.role === 'admin' ? badge('Administrateur', 'blue') : u.active === false ? badge('Désactivé', 'gray') : badge('Actif', 'green')}</td>
+    <td class="text-xs text-slate-600">${u.role === 'admin' ? 'Tous les droits' : esc(normV(u.permissions)) || 'Aucun'}</td></tr>`).join('')}
+  </tbody></table></div>`;
+}
+function openUser(id) {
+  const u = id ? state.users.find(x => x.id === id) : { active: true, permissions: {}, role: 'user' };
+  if (id && !u) return;
+  const isAdmin = u.role === 'admin';
+  openModal(`
+  <div class="flex items-center justify-between p-4 border-b"><h2 class="text-lg font-semibold">${id ? `Utilisateur ${esc(u.username)}` : 'Nouvel utilisateur'}</h2>
+    <button class="btn btn-ghost" data-act="close">Fermer</button></div>
+  <form data-form="user" data-id="${id || ''}" class="p-4 space-y-4 max-w-2xl">
+    <div class="grid sm:grid-cols-2 gap-3">
+      <label class="block text-sm font-medium">Identifiant *<input class="fld" name="username" value="${esc(u.username)}" ${id ? 'readonly' : 'required'} pattern="[a-zA-Z0-9._-]{2,40}" title="Lettres, chiffres, point, tiret (2 à 40)"></label>
+      <label class="block text-sm font-medium">Nom affiché<input class="fld" name="displayName" value="${esc(u.displayName)}"></label>
+      <label class="block text-sm font-medium sm:col-span-2">${id ? 'Nouveau mot de passe (laisser vide pour conserver)' : 'Mot de passe *'}
+        <input class="fld" name="password" type="password" minlength="8" autocomplete="new-password" ${id ? '' : 'required'}></label>
+    </div>
+    <label class="flex items-center gap-2 text-sm font-medium"><input type="checkbox" name="active" ${u.active !== false ? 'checked' : ''} ${isAdmin ? 'disabled' : ''}> Compte actif</label>
+    <fieldset class="border rounded-md p-3" ${isAdmin ? 'disabled' : ''}>
+      <legend class="text-sm font-medium px-1">Permissions</legend>
+      <div class="grid sm:grid-cols-2 gap-2">
+      ${PERMS.map(p => `<label class="flex items-center gap-2 text-sm"><input type="checkbox" name="perm_${p.key}" ${isAdmin || u.permissions?.[p.key] ? 'checked' : ''}> ${p.label}</label>`).join('')}
+      </div>
+      ${isAdmin ? '<p class="text-xs text-slate-500 mt-2">Le compte administrateur dispose de tous les droits (non modifiable).</p>' : ''}
+    </fieldset>
+    <div class="flex gap-2"><button class="btn btn-primary" type="submit">Enregistrer</button>
+      ${id && !isAdmin ? `<button class="btn btn-danger" type="button" data-act="user-delete" data-id="${id}">Supprimer</button>` : ''}</div>
+  </form>`);
+}
+function openPwd() {
+  openModal(`<div class="flex items-center justify-between p-4 border-b"><h2 class="text-lg font-semibold">Changer mon mot de passe</h2><button class="btn btn-ghost" data-act="close">Fermer</button></div>
+  <form data-form="pwd" class="p-4 space-y-3 max-w-sm">
+    <label class="block text-sm font-medium">Mot de passe actuel<input class="fld" type="password" name="old" required autocomplete="current-password"></label>
+    <label class="block text-sm font-medium">Nouveau mot de passe (8 caractères min.)<input class="fld" type="password" name="new" required minlength="8" autocomplete="new-password"></label>
+    <button class="btn btn-primary" type="submit">Enregistrer</button></form>`);
+}
+
+/* =====================================================================
+   15. MODALE
+   ===================================================================== */
+function openModal(html) { $('#modal-body').innerHTML = html; $('#modal').classList.remove('hidden'); document.body.style.overflow = 'hidden'; }
+function closeModal() { $('#modal').classList.add('hidden'); $('#modal-body').innerHTML = ''; document.body.style.overflow = ''; }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+$('#modal').addEventListener('mousedown', e => { if (e.target.id === 'modal' || e.target === $('#modal > div')) closeModal(); });
+
+/* =====================================================================
+   16. ÉVÉNEMENTS (délégation)
+   ===================================================================== */
+document.addEventListener('click', async ev => {
+  const el = ev.target.closest('[data-act]'); if (!el) return;
+  const id = el.dataset.id;
+  try {
+    switch (el.dataset.act) {
+      case 'close': closeModal(); break;
+      case 'logout': logout(); break;
+      case 'pwd': openPwd(); break;
+      case 'export-csv': exportCsv(); break;
+      case 'esp-new': openEsp(null); break;
+      case 'esp-open': openEsp(id); break;
+      case 'esp-delete': {
+        const e = espById(id); const cs = state.controls.filter(c => c.espId === id);
+        if (!confirm(`Supprimer l'ESP ${e.tag} et ses ${cs.length} contrôle(s) ? Cette action est tracée dans le journal d'audit.`)) return;
+        await deleteWithAudit({ col: 'esp', id, entity: 'ESP', label: e.tag, espId: id,
+          changes: [{ field: 'Contrôles supprimés', old: cs.map(c => `${c.type} ${c.doneDate || c.plannedDate || ''}`).join(' ; ').slice(0, 200), new: '' }],
+          alsoDelete: cs.map(c => ({ col: 'controls', id: c.id })) });
+        closeModal(); toast('ESP supprimé'); break; }
+      case 'ctrl-new': openCtrl(null, el.dataset.esp); break;
+      case 'ctrl-open': openCtrl(id); break;
+      case 'ctrl-delete': {
+        const c = state.controls.find(x => x.id === id);
+        if (!confirm('Supprimer ce contrôle ? Cette action est tracée dans le journal d\'audit.')) return;
+        await deleteWithAudit({ col: 'controls', id, entity: 'Contrôle', label: `${c.type} – ${espById(c.espId)?.tag || ''}`, espId: c.espId,
+          changes: [{ field: 'Contrôle supprimé', old: `${c.status} ${c.doneDate || c.plannedDate || ''} ${c.result || ''}`, new: '' }] });
+        closeModal(); toast('Contrôle supprimé'); break; }
+      case 'att-add': {
+        const name = $('#att-name').value.trim(), url = $('#att-url').value.trim();
+        if (!name || !isHttp(url)) return toast('Renseignez un nom et une URL commençant par http(s)://', 'err');
+        ctrlAtt.push({ name, url, kind: 'link' }); $('#att-list').innerHTML = attList(false); $('#att-name').value = $('#att-url').value = ''; break; }
+      case 'att-del': ctrlAtt.splice(+el.dataset.i, 1); $('#att-list').innerHTML = attList(false); break;
+      case 'user-new': openUser(null); break;
+      case 'user-open': openUser(id); break;
+      case 'user-delete': {
+        if (!confirm(`Supprimer l'utilisateur ${id} ?`)) return;
+        await deleteWithAudit({ col: 'users', id, entity: 'Utilisateur', label: id });
+        closeModal(); toast('Utilisateur supprimé'); break; }
+    }
+  } catch (e) { console.error(e); toast('Erreur : ' + e.message, 'err'); }
+});
+
+// Filtres : mise à jour partielle pour conserver le focus dans les champs
+document.addEventListener('input', ev => {
+  const p = ev.target.dataset?.filter; if (!p) return;
+  const [a, b] = p.split('.'); if (b) state[a][b] = ev.target.value; else state[a] = ev.target.value;
+  const t = { fEsp: ['#esp-table', espTable], fCtrl: ['#ctrl-table', ctrlTable], fAudit: ['#audit-table', auditBody] }[a];
+  $(t[0]).innerHTML = t[1]();
+});
+
+document.addEventListener('submit', async ev => {
+  const form = ev.target, kind = form.dataset.form; if (!kind) return;
+  ev.preventDefault();
+  const fd = new FormData(form), g = k => (fd.get(k) || '').toString().trim();
+  const btn = form.querySelector('[type=submit]'); if (btn) btn.disabled = true;
+  try {
+    if (kind === 'login') {
+      try { startSession(await login(g('username'), fd.get('password'))); }
+      catch (e) { renderLogin(e.message); }
+      return;
+    }
+    if (kind === 'esp') {
+      const id = form.dataset.id || db.collection('esp').doc().id, before = form.dataset.id ? espById(id) : null;
+      const tag = g('tag');
+      if (state.esp.some(e => e.id !== id && (e.tag || '').toLowerCase() === tag.toLowerCase())) throw new Error(`Le tag « ${tag} » existe déjà.`);
+      const data = { tag, serial: g('serial'), manufacturer: g('manufacturer'), year: num(g('year')), category: g('category'), type: g('type'),
+        fluid: g('fluid'), fluidGroup: g('fluidGroup'), ps: num(g('ps')), volume: num(g('volume')), dn: num(g('dn')), atex: g('atex'), status: g('status'),
+        building: g('building'), workshop: g('workshop'), location: g('location'), commissioningDate: g('commissioningDate'),
+        ipMonths: num(g('ipMonths')), rpMonths: num(g('rpMonths')), notes: g('notes') };
+      const changed = await saveWithAudit({ col: 'esp', id, data, before, entity: 'ESP', label: tag, espId: id });
+      closeModal(); toast(changed ? 'ESP enregistré' : 'Aucune modification', changed ? 'ok' : 'info');
+    }
+    if (kind === 'ctrl') {
+      const id = form.dataset.id || db.collection('controls').doc().id, before = form.dataset.id ? state.controls.find(c => c.id === id) : null;
+      const st = g('status');
+      if (st !== 'Planifié' && !g('doneDate')) throw new Error('La date de réalisation est obligatoire pour un contrôle réalisé ou clôturé.');
+      if (st === 'Clôturé' && !g('result')) throw new Error('Le résultat est obligatoire pour clôturer un contrôle.');
+      if (st === 'Clôturé' && !can('validate_control')) throw new Error("Vous n'avez pas le droit de clôturer un contrôle.");
+      const att = [...ctrlAtt];
+      const files = [...(form.elements.files?.files || [])];
+      for (const f of files) {
+        if (f.size > 10 * 1024 * 1024) throw new Error(`${f.name} dépasse 10 Mo.`);
+        const ref = storage.ref(`controls/${id}/${Date.now()}_${f.name.replace(/[^\w.-]/g, '_')}`);
+        await ref.put(f); att.push({ name: f.name, url: await ref.getDownloadURL(), kind: 'file' });
+      }
+      const closing = st === 'Clôturé' && before?.status !== 'Clôturé';
+      const data = { espId: g('espId'), type: g('type'), status: st, plannedDate: g('plannedDate'), doneDate: g('doneDate'), inspector: g('inspector'),
+        result: g('result'), comment: g('comment'), attachments: att,
+        validatedBy: closing ? state.user.username : (st === 'Clôturé' ? before?.validatedBy || '' : ''),
+        validatedAt: closing ? todayISO() : (st === 'Clôturé' ? before?.validatedAt || '' : '') };
+      const e = espById(data.espId);
+      const changed = await saveWithAudit({ col: 'controls', id, data, before, entity: 'Contrôle', label: `${data.type} – ${e?.tag || ''}`, espId: data.espId });
+      closeModal(); toast(changed ? 'Contrôle enregistré' : 'Aucune modification', changed ? 'ok' : 'info');
+    }
+    if (kind === 'user') {
+      const editing = !!form.dataset.id; const username = (editing ? form.dataset.id : g('username')).toLowerCase();
+      const before = editing ? state.users.find(u => u.id === username) : null;
+      if (!editing && state.users.some(u => u.id === username)) throw new Error('Cet identifiant existe déjà.');
+      const isAdmin = before?.role === 'admin';
+      const permissions = {}; PERMS.forEach(p => { permissions[p.key] = isAdmin ? true : !!fd.get('perm_' + p.key); });
+      const data = { username, displayName: g('displayName'), role: before?.role || 'user', active: isAdmin ? true : !!fd.get('active'), permissions: isAdmin ? (before.permissions || {}) : permissions };
+      const pw = fd.get('password');
+      if (pw) { data.salt = newSalt(); data.hash = await hashPw(pw, data.salt); }
+      const auditData = { displayName: data.displayName, active: data.active, permissions: data.permissions, ...(pw ? { password: '(modifié)' } : {}) };
+      const changes = diff(before, auditData);
+      if (before && !changes.length) { closeModal(); return toast('Aucune modification', 'info'); }
+      const batch = db.batch();
+      batch.set(db.collection('users').doc(username), { ...data, ...(before ? {} : { createdAt: FV.serverTimestamp() }) }, { merge: true });
+      batch.set(db.collection('audit').doc(), auditEntry({ action: before ? 'Modification' : 'Création', entity: 'Utilisateur', entityId: username, label: username, changes }));
+      await batch.commit(); closeModal(); toast('Utilisateur enregistré');
+    }
+    if (kind === 'pwd') {
+      const u = (await db.collection('users').doc(state.user.username).get()).data();
+      if (await hashPw(fd.get('old'), u.salt) !== u.hash) throw new Error('Mot de passe actuel incorrect.');
+      const salt = newSalt();
+      const batch = db.batch();
+      batch.update(db.collection('users').doc(u.username), { salt, hash: await hashPw(fd.get('new'), salt) });
+      batch.set(db.collection('audit').doc(), auditEntry({ action: 'Modification', entity: 'Utilisateur', entityId: u.username, label: u.username, changes: [{ field: 'Mot de passe', old: '', new: '(modifié par l\'utilisateur)' }] }));
+      await batch.commit(); closeModal(); toast('Mot de passe modifié');
+    }
+  } catch (e) { console.error(e); toast(e.message, 'err'); }
+  finally { if (btn) btn.disabled = false; }
+});
+
+/* =====================================================================
+   17. DÉMARRAGE
+   ===================================================================== */
+(async function boot() {
+  if (FIREBASE_CONFIG.apiKey.startsWith('VOTRE')) return configMissing();
+  initFirebase();
+  if (USE_ANON_AUTH) { try { await auth.signInAnonymously(); } catch (e) { console.warn('Auth anonyme indisponible :', e.message); toast("Activez l'authentification anonyme dans Firebase (voir README).", 'err'); } }
+  const saved = sessionStorage.getItem('esp_user');
+  if (saved) {
+    try { const s = await db.collection('users').doc(saved).get(); if (s.exists && s.data().active !== false) return startSession(s.data()); } catch (e) { console.error(e); }
+  }
+  renderLogin();
+})();
+</script>
+</body>
+</html>
