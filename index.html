@@ -79,6 +79,7 @@ const PERMS = [
   { key: 'delete_esp',       label: 'Supprimer un ESP' },
   { key: 'enter_control',    label: 'Saisir un rapport de contrôle' },
   { key: 'validate_control', label: 'Valider / Clôturer un contrôle' },
+  { key: 'open_carl',        label: 'Ouvrir CARL Source depuis les écarts (clic sur un n° d\'intervention)' },
   { key: 'view_audit',       label: "Consulter le journal d'audit" },
   { key: 'manage_users',     label: 'Gérer les utilisateurs' }
 ];
@@ -112,6 +113,7 @@ const FL = { // libellés des champs pour le journal d'audit
   espId: 'Équipement', plannedDate: 'Date planifiée', doneDate: 'Date de réalisation', inspector: 'Organisme / inspecteur',
   result: 'Résultat', comment: 'Commentaire', attachments: 'Pièces jointes', validatedBy: 'Validé par', validatedAt: 'Validé le',
   gapRequired: 'Écart à traiter', gapNumber: "N° d'intervention CARL", gapLabel: "Désignation de l'écart",
+  gaps: 'Écarts (n° CARL – désignation)',
   displayName: 'Nom affiché', active: 'Compte actif', permissions: 'Permissions', password: 'Mot de passe'
 };
 
@@ -288,7 +290,7 @@ const dueClass = d => !d.monitored || d.days === null ? 'gray' : d.days < 0 ? 'r
    ===================================================================== */
 const normV = v => {
   if (v == null || v === '') return '';
-  if (Array.isArray(v)) return v.map(a => typeof a === 'string' ? a : a.name).join(', ');
+  if (Array.isArray(v)) return v.map(a => typeof a === 'string' ? a : (a.name ?? [a.number, a.label].filter(Boolean).join(' – '))).join(', ');
   if (typeof v === 'object') return Object.entries(v).filter(([, x]) => x).map(([k]) => (PERMS.find(p => p.key === k) || {}).label || k).join(', ');
   return String(v);
 };
@@ -688,14 +690,30 @@ const resultBadge = r => r ? badge(r, { 'Conforme': 'green', 'Conforme avec rés
 
 const GAP_OPTS = ['Oui', 'Non'];
 const isCarlNo = n => /^\d{6}$/.test(String(n || '').trim());
-const carlLink = c => isCarlNo(c.gapNumber)
+const carlLink = c => isCarlNo(c.gapNumber) && can('open_carl')
   ? `<a href="${esc(CARL_URL)}" target="_blank" rel="noopener noreferrer" data-copy="${esc(String(c.gapNumber).trim())}" class="font-medium text-sky-700 underline" title="Ouvrir CARL Source (le n° ${esc(c.gapNumber)} est copié pour la recherche)">${esc(c.gapNumber)} ↗</a>`
-  : `<span class="font-medium">${esc(c.gapNumber)}</span>`;
+  : `<span class="font-medium"${isCarlNo(c.gapNumber) ? ' title="Accès à CARL non autorisé pour votre compte"' : ''}>${esc(c.gapNumber)}</span>`;
 document.addEventListener('click', ev => {   // copie du n° d'intervention au clic sur le lien CARL
   const a = ev.target.closest('a[data-copy]'); if (!a) return;
+  if (!can('open_carl')) { ev.preventDefault(); toast("Votre compte n'est pas autorisé à ouvrir CARL Source.", 'err'); return; }   // contrôle d'accès : le clic est bloqué
   navigator.clipboard?.writeText(a.dataset.copy).then(() => toast(`N° ${a.dataset.copy} copié : collez-le dans la recherche CARL Source`, 'info'), () => {});
 });
 const gapOf = c => c.gapRequired === 'Oui' ? 'Oui' : 'Non';
+/* Écarts d'un contrôle : liste [{ number, label }]. Les anciens contrôles (un seul écart : gapNumber / gapLabel) sont repris automatiquement. */
+const gapsOf = c => Array.isArray(c.gaps) ? c.gaps.filter(x => x && (x.number || x.label))
+  : ((c.gapNumber || c.gapLabel) ? [{ number: c.gapNumber || '', label: c.gapLabel || '' }] : []);
+const GAP_MAX_INLINE = 3;   // nombre maximum de n° d'intervention affichés dans la liste des contrôles
+const gapRow = x => `<div data-gap-row class="grid sm:grid-cols-[1fr_2fr_auto] gap-3 items-start">
+    <div><label class="block text-sm font-medium">N° d'intervention CARL Source (6 chiffres)
+      <input class="fld" name="gapNumber" value="${esc(x.number)}" inputmode="numeric" maxlength="6" pattern="\\d{6}" title="6 chiffres"></label>
+      <div class="gap-link text-xs mt-1"></div></div>
+    <label class="block text-sm font-medium">Désignation de l'écart (succincte)
+      <input class="fld" name="gapLabel" value="${esc(x.label)}" maxlength="200"></label>
+    <button type="button" class="btn btn-danger sm:mt-6" data-act="gap-del" title="Retirer cet écart">Retirer</button></div>`;
+function updGapLink(row) {   // lien « Ouvrir CARL » sous le n° saisi (uniquement si le compte a le droit d'ouvrir CARL)
+  const n = row.querySelector('[name=gapNumber]').value.trim();
+  row.querySelector('.gap-link').innerHTML = isCarlNo(n) && can('open_carl') ? carlLink({ gapNumber: n }).replace(/>\d{6} ↗</, '>Ouvrir CARL Source ↗<') : '';
+}
 const RESULT_RANK = { 'Conforme': 1, 'Conforme avec réserves': 2, 'Non conforme': 3 };
 /* Colonnes de la liste : clé de tri, libellé, valeur de tri (les valeurs vides sont toujours placées en fin de liste) */
 const CTRL_COLS = [
@@ -707,7 +725,7 @@ const CTRL_COLS = [
   { key: 'done',    label: 'Réalisé',            v: c => c.doneDate || '' },
   { key: 'inspector', label: 'Organisme',        v: c => c.inspector || '' },
   { key: 'result',  label: 'Résultat',           v: c => RESULT_RANK[c.result] || '' },   // ordre logique : conforme → réserves → non conforme
-  { key: 'gap',     label: 'Écarts à traiter',   v: c => gapOf(c) === 'Oui' ? 1 : 0 },
+  { key: 'gap',     label: 'Écarts à traiter',   v: c => gapOf(c) === 'Oui' ? Math.max(1, gapsOf(c).length) : 0 },
   { key: 'att',     label: 'Pièces jointes',     v: c => (c.attachments || []).length }
 ];
 function viewControls() {
@@ -726,12 +744,22 @@ function viewControls() {
   </div>
   <div id="ctrl-table" class="bg-white rounded-lg shadow-sm mt-3 overflow-x-auto">${ctrlTable()}</div>`;
 }
+/* Colonne « Écarts » : nombre d'écarts + 3 n° d'intervention maximum ; au-delà, il faut ouvrir la ligne du contrôle */
+function gapCellInfo(c) {
+  const gs = gapsOf(c), n = gs.length;
+  if (!n) return `<div class="text-xs text-slate-500 mt-1">Aucun écart saisi</div>`;
+  const shown = gs.slice(0, GAP_MAX_INLINE).map(x => x.number ? carlLink({ gapNumber: x.number }) : `<span class="text-slate-600" title="${esc(x.label)}">(sans n°)</span>`).join(' · ');
+  const more = n - GAP_MAX_INLINE;
+  return `<div class="text-xs font-semibold text-red-800 mt-1">${n} écart${n > 1 ? 's' : ''}</div>
+    <div class="text-xs mt-0.5">${shown}</div>
+    ${more > 0 ? `<div class="text-xs text-slate-500 mt-0.5">+ ${more} autre${more > 1 ? 's' : ''} : ouvrir la ligne du contrôle</div>` : ''}`;
+}
 function ctrlTable() {
   const f = state.fCtrl, q = f.q.toLowerCase(), vis = visibleIds(), sc = state.sCtrl;
   const rows = state.controls.filter(c => {
     if (!vis.has(c.espId)) return false;
     const e = espById(c.espId);
-    if (q && !`${e?.tag} ${e?.name} ${c.inspector} ${c.comment} ${c.gapNumber} ${c.gapLabel}`.toLowerCase().includes(q)) return false;
+    if (q && !`${e?.tag} ${e?.name} ${c.inspector} ${c.comment} ${gapsOf(c).map(x => x.number + ' ' + x.label).join(' ')}`.toLowerCase().includes(q)) return false;
     return (!f.type || c.type === f.type) && (!f.status || c.status === f.status) && (!f.result || c.result === f.result) && (!f.gap || gapOf(c) === f.gap);
   }).sort((a, b) => (b.doneDate || b.plannedDate || '').localeCompare(a.doneDate || a.plannedDate || ''));   // ordre par défaut : date décroissante
   const col = CTRL_COLS.find(x => x.key === sc.key);
@@ -751,7 +779,7 @@ function ctrlTable() {
   ${rows.map(c => { const e = espById(c.espId), g = gapOf(c) === 'Oui';
     return `<tr data-act="ctrl-open" data-id="${c.id}"><td class="font-medium">${esc(e?.tag || '(supprimé)')}</td><td>${esc(e?.name || '—')}</td><td>${esc(c.type)}</td><td>${ctrlStatusBadge(c.status)}</td>
     <td>${fmtDate(c.plannedDate)}</td><td>${fmtDate(c.doneDate)}</td><td>${esc(c.inspector)}</td><td>${resultBadge(c.result)}</td>
-    <td>${badge(g ? 'Oui' : 'Non', g ? 'red' : 'gray')}${g && (c.gapNumber || c.gapLabel) ? `<div class="text-xs text-slate-600 mt-1">${c.gapNumber ? carlLink(c) : ''}${c.gapNumber && c.gapLabel ? ' · ' : ''}${esc(c.gapLabel)}</div>` : ''}</td>
+    <td>${badge(g ? 'Oui' : 'Non', g ? 'red' : 'gray')}${g ? gapCellInfo(c) : ''}</td>
     <td>${(c.attachments || []).length}</td></tr>`; }).join('')
     || `<tr><td colspan="10" class="text-slate-500">Aucun contrôle enregistré.</td></tr>`}</tbody></table>`;
 }
@@ -788,10 +816,9 @@ function openCtrl(id, espId, preset) {
       ${inp('inspector', 'Organisme / inspecteur', c.inspector)}
       ${sel('result', 'Résultat', RESULTS, c.result)}
       ${sel('gapRequired', 'Écart à traiter', GAP_OPTS, gapOf(c), { blank: false })}
-      <div class="hidden sm:col-span-2 grid sm:grid-cols-[1fr_2fr] gap-3 rounded-md border border-red-200 bg-red-50/50 p-3" id="gap-fields">
-        <div>${inp('gapNumber', "N° d'intervention CARL Source (6 chiffres)", c.gapNumber, { attr: 'inputmode="numeric" maxlength="6" pattern="\\d{6}" title="6 chiffres"' })}
-          <div id="gap-link" class="text-xs mt-1"></div></div>
-        ${inp('gapLabel', "Désignation de l'écart (succincte)", c.gapLabel, { attr: 'maxlength="200"' })}
+      <div class="hidden sm:col-span-2 rounded-md border border-red-200 bg-red-50/50 p-3" id="gap-fields">
+        <div id="gap-rows" class="grid gap-3">${(gapsOf(c).length ? gapsOf(c) : [{}]).map(gapRow).join('')}</div>
+        ${ro ? '' : `<button type="button" class="btn btn-ghost mt-3" data-act="gap-add">+ Ajouter un écart</button>`}
       </div>
       <label class="block text-sm font-medium sm:col-span-2">Commentaire / réserves<textarea class="fld" name="comment" rows="3">${esc(c.comment)}</textarea></label>
       <div class="sm:col-span-2">
@@ -812,8 +839,8 @@ function openCtrl(id, espId, preset) {
   </form>`);
   const showGap = () => $('#gap-fields').classList.toggle('hidden', $('[name=gapRequired]').value !== 'Oui');
   $('[name=gapRequired]').addEventListener('change', showGap); showGap();
-  const showLink = () => { const n = $('[name=gapNumber]').value.trim(); $('#gap-link').innerHTML = isCarlNo(n) ? carlLink({ gapNumber: n }).replace(/>\d{6} ↗</, '>Ouvrir CARL Source ↗<') : ''; };
-  $('[name=gapNumber]').addEventListener('input', showLink); showLink();
+  $('#gap-fields').addEventListener('input', ev => { if (ev.target.name === 'gapNumber') updGapLink(ev.target.closest('[data-gap-row]')); });
+  document.querySelectorAll('#gap-rows [data-gap-row]').forEach(updGapLink);
 }
 
 /* =====================================================================
@@ -990,8 +1017,8 @@ function demoSpecs() {
   ];
 }
 const DEMO_USERS = [
-  { username: 'inspecteur', displayName: 'Camille Roux (responsable réglementaire)', perms: ['view_esp', 'edit_esp', 'enter_control', 'validate_control', 'view_audit'], poles: [] },
-  { username: 'op.synthese', displayName: "Karim Benali (chef d'atelier Synthèse)", perms: ['view_esp', 'edit_esp', 'enter_control'], poles: ['Synthèse aromatique'] },
+  { username: 'inspecteur', displayName: 'Camille Roux (responsable réglementaire)', perms: ['view_esp', 'edit_esp', 'enter_control', 'validate_control', 'open_carl', 'view_audit'], poles: [] },
+  { username: 'op.synthese', displayName: "Karim Benali (chef d'atelier Synthèse)", perms: ['view_esp', 'edit_esp', 'enter_control', 'open_carl'], poles: ['Synthèse aromatique'] },
   { username: 'lecture.utilites', displayName: 'Julie Martin (technicienne Utilités)', perms: ['view_esp'], poles: ['Utilités'] }
 ];
 
@@ -1123,6 +1150,14 @@ document.addEventListener('click', async ev => {
         closeModal(); toast('ESP supprimé'); break; }
       case 'ctrl-new': openCtrl(null, el.dataset.esp); break;
       case 'ctrl-open': openCtrl(id); break;
+      case 'gap-add': {
+        const box = $('#gap-rows'); box.insertAdjacentHTML('beforeend', gapRow({}));
+        box.lastElementChild.querySelector('[name=gapNumber]').focus(); break; }
+      case 'gap-del': {
+        const row = el.closest('[data-gap-row]'), box = $('#gap-rows');
+        if (box.children.length > 1) { row.remove(); $('[data-act="gap-add"]')?.focus(); }
+        else { row.querySelectorAll('input').forEach(i => { i.value = ''; }); updGapLink(row); }   // dernière ligne : on la vide
+        break; }
       case 'ctrl-delete': {
         const c = state.controls.find(x => x.id === id);
         if (!confirm('Supprimer ce contrôle ? Cette action est tracée dans le journal d\'audit.')) return;
@@ -1180,12 +1215,16 @@ document.addEventListener('submit', async ev => {
       closeModal(); toast(changed ? 'ESP enregistré' : 'Aucune modification', changed ? 'ok' : 'info');
     }
     if (kind === 'ctrl') {
-      const id = form.dataset.id || db.collection('controls').doc().id, before = form.dataset.id ? { gapRequired: 'Non', gapNumber: '', gapLabel: '', ...state.controls.find(c => c.id === id) } : null;   // anciens contrôles : écart = « Non »
+      const id = form.dataset.id || db.collection('controls').doc().id, before = form.dataset.id ? (c0 => ({ gapRequired: 'Non', ...c0, gaps: gapsOf(c0), gapNumber: '', gapLabel: '' }))(state.controls.find(c => c.id === id)) : null;   // anciens contrôles : écart = « Non », ancien écart unique repris dans « gaps »
       const st = g('status');
       if (st !== 'Planifié' && !g('doneDate')) throw new Error('La date de réalisation est obligatoire pour un contrôle réalisé ou clôturé.');
       if (st === 'Clôturé' && !g('result')) throw new Error('Le résultat est obligatoire pour clôturer un contrôle.');
       if (st === 'Clôturé' && !can('validate_control')) throw new Error("Vous n'avez pas le droit de clôturer un contrôle.");
-      if (g('gapRequired') === 'Oui' && g('gapNumber') && !isCarlNo(g('gapNumber'))) throw new Error("Le n° d'intervention CARL Source doit comporter exactement 6 chiffres.");
+      const gapYes = g('gapRequired') === 'Oui', gapLabels = fd.getAll('gapLabel');
+      const gaps = gapYes ? fd.getAll('gapNumber').map((n, k) => ({ number: String(n).trim(), label: String(gapLabels[k] || '').trim() })).filter(x => x.number || x.label) : [];
+      if (gaps.some(x => x.number && !isCarlNo(x.number))) throw new Error("Le n° d'intervention CARL Source doit comporter exactement 6 chiffres.");
+      const dup = gaps.map(x => x.number).filter((n, k, a) => n && a.indexOf(n) !== k)[0];
+      if (dup) throw new Error(`Le n° d'intervention ${dup} est saisi plusieurs fois.`);
       const att = [...ctrlAtt];
       const files = [...(form.elements.files?.files || [])];
       for (const f of files) {
@@ -1196,7 +1235,7 @@ document.addEventListener('submit', async ev => {
       const closing = st === 'Clôturé' && before?.status !== 'Clôturé';
       const data = { espId: g('espId'), type: g('type'), status: st, plannedDate: g('plannedDate'), doneDate: g('doneDate'), inspector: g('inspector'),
         result: g('result'), comment: g('comment'), attachments: att,
-        gapRequired: g('gapRequired') === 'Oui' ? 'Oui' : 'Non', gapNumber: g('gapRequired') === 'Oui' ? g('gapNumber') : '', gapLabel: g('gapRequired') === 'Oui' ? g('gapLabel') : '',
+        gapRequired: gapYes ? 'Oui' : 'Non', gaps, gapNumber: '', gapLabel: '',   // gapNumber / gapLabel : anciens champs (écart unique), vidés à l'enregistrement
         validatedBy: closing ? state.user.username : (st === 'Clôturé' ? before?.validatedBy || '' : ''),
         validatedAt: closing ? todayISO() : (st === 'Clôturé' ? before?.validatedAt || '' : '') };
       const e = espById(data.espId);
