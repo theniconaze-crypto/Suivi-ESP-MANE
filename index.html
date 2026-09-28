@@ -108,6 +108,7 @@ const FL = { // libellés des champs pour le journal d'audit
   rpMonths: 'Périodicité requalif. (mois)', notes: 'Remarques',
   espId: 'Équipement', plannedDate: 'Date planifiée', doneDate: 'Date de réalisation', inspector: 'Organisme / inspecteur',
   result: 'Résultat', comment: 'Commentaire', attachments: 'Pièces jointes', validatedBy: 'Validé par', validatedAt: 'Validé le',
+  gapRequired: 'Écart à traiter', gapNumber: "N° d'écart", gapLabel: "Désignation de l'écart",
   displayName: 'Nom affiché', active: 'Compte actif', permissions: 'Permissions', password: 'Mot de passe'
 };
 
@@ -154,7 +155,7 @@ async function hashPw(pw, salt) {
    4. ÉTAT GLOBAL & FIREBASE
    ===================================================================== */
 const state = { user: null, esp: [], controls: [], audit: [], users: [], config: {}, configError: '', route: 'dashboard',
-  fDash: { pole: '', due: '', plan: '', next: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' };
+  fDash: { pole: '', due: '', plan: '', next: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '', result: '', gap: '' }, sCtrl: { key: '', dir: 'asc' }, fAudit: '' };
 let db, auth, storage, FV; const unsubs = []; let charts = [];
 const app = $('#app');
 
@@ -347,7 +348,7 @@ function startSession(u) {
 function logout() {
   unsubs.splice(0).forEach(f => f()); sessionStorage.removeItem('esp_user');
   Object.assign(state, { user: null, esp: [], controls: [], audit: [], users: [],
-    config: {}, configError: '', fDash: { pole: '', due: '', plan: '', next: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' });
+    config: {}, configError: '', fDash: { pole: '', due: '', plan: '', next: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '', result: '', gap: '' }, sCtrl: { key: '', dir: 'asc' }, fAudit: '' });
   closeModal(); renderLogin();
 }
 /* Signature canonique des droits : Firestore ne garantit pas l'ordre des clés d'une map (cache local vs serveur),
@@ -682,6 +683,22 @@ async function loadHistory(espId) {
 const ctrlStatusBadge = s => badge(s || '—', { 'Planifié': 'blue', 'Réalisé': 'yellow', 'Clôturé': 'green' }[s] || 'gray');
 const resultBadge = r => r ? badge(r, { 'Conforme': 'green', 'Conforme avec réserves': 'orange', 'Non conforme': 'red' }[r]) : '—';
 
+const GAP_OPTS = ['Oui', 'Non'];
+const gapOf = c => c.gapRequired === 'Oui' ? 'Oui' : 'Non';
+const RESULT_RANK = { 'Conforme': 1, 'Conforme avec réserves': 2, 'Non conforme': 3 };
+/* Colonnes de la liste : clé de tri, libellé, valeur de tri (les valeurs vides sont toujours placées en fin de liste) */
+const CTRL_COLS = [
+  { key: 'tag',     label: 'Tag',                v: c => espById(c.espId)?.tag || '' },
+  { key: 'name',    label: 'Désignation',        v: c => espById(c.espId)?.name || '' },
+  { key: 'type',    label: 'Type de contrôle',   v: c => c.type || '' },
+  { key: 'status',  label: 'Statut',             v: c => c.status || '' },
+  { key: 'planned', label: 'Planifié',           v: c => c.plannedDate || '' },
+  { key: 'done',    label: 'Réalisé',            v: c => c.doneDate || '' },
+  { key: 'inspector', label: 'Organisme',        v: c => c.inspector || '' },
+  { key: 'result',  label: 'Résultat',           v: c => RESULT_RANK[c.result] || '' },   // ordre logique : conforme → réserves → non conforme
+  { key: 'gap',     label: 'Écarts à traiter',   v: c => gapOf(c) === 'Oui' ? 1 : 0 },
+  { key: 'att',     label: 'Pièces jointes',     v: c => (c.attachments || []).length }
+];
 function viewControls() {
   const f = state.fCtrl;
   return `
@@ -689,25 +706,43 @@ function viewControls() {
     <h1 class="text-xl font-semibold">Contrôles réglementaires</h1>
     ${can('enter_control') ? `<button class="btn btn-primary" data-act="ctrl-new">Saisir un contrôle</button>` : ''}
   </div>
-  <div class="bg-white rounded-lg shadow-sm p-3 grid sm:grid-cols-3 gap-3">
-    <input class="fld !mt-0" placeholder="Rechercher (tag, organisme…)" value="${esc(f.q)}" data-filter="fCtrl.q">
+  <div class="bg-white rounded-lg shadow-sm p-3 grid sm:grid-cols-2 lg:grid-cols-5 gap-3">
+    <input class="fld !mt-0" placeholder="Rechercher (tag, désignation, organisme, écart…)" value="${esc(f.q)}" data-filter="fCtrl.q">
     <select class="fld !mt-0" data-filter="fCtrl.type">${opt(CTRL_TYPES, f.type, 'Tous les types')}</select>
     <select class="fld !mt-0" data-filter="fCtrl.status">${opt(CTRL_STATUS, f.status, 'Tous les statuts')}</select>
+    <select class="fld !mt-0" data-filter="fCtrl.result">${opt(RESULTS, f.result, 'Tous les résultats')}</select>
+    <select class="fld !mt-0" data-filter="fCtrl.gap">${opt(GAP_OPTS, f.gap, 'Écarts : tous')}</select>
   </div>
   <div id="ctrl-table" class="bg-white rounded-lg shadow-sm mt-3 overflow-x-auto">${ctrlTable()}</div>`;
 }
 function ctrlTable() {
-  const f = state.fCtrl, q = f.q.toLowerCase(), vis = visibleIds();
+  const f = state.fCtrl, q = f.q.toLowerCase(), vis = visibleIds(), sc = state.sCtrl;
   const rows = state.controls.filter(c => {
     if (!vis.has(c.espId)) return false;
     const e = espById(c.espId);
-    if (q && !`${e?.tag} ${c.inspector} ${c.comment}`.toLowerCase().includes(q)) return false;
-    return (!f.type || c.type === f.type) && (!f.status || c.status === f.status);
-  }).sort((a, b) => (b.doneDate || b.plannedDate || '').localeCompare(a.doneDate || a.plannedDate || ''));
-  return `<table class="w-full min-w-[820px]"><thead><tr><th>ESP</th><th>Type de contrôle</th><th>Statut</th><th>Planifié</th><th>Réalisé</th><th>Organisme</th><th>Résultat</th><th>Pièces</th></tr></thead><tbody>
-  ${rows.map(c => `<tr data-act="ctrl-open" data-id="${c.id}"><td class="font-medium">${esc(espById(c.espId)?.tag || '(supprimé)')}</td><td>${esc(c.type)}</td><td>${ctrlStatusBadge(c.status)}</td>
-    <td>${fmtDate(c.plannedDate)}</td><td>${fmtDate(c.doneDate)}</td><td>${esc(c.inspector)}</td><td>${resultBadge(c.result)}</td><td>${(c.attachments || []).length}</td></tr>`).join('')
-    || `<tr><td colspan="8" class="text-slate-500">Aucun contrôle enregistré.</td></tr>`}</tbody></table>`;
+    if (q && !`${e?.tag} ${e?.name} ${c.inspector} ${c.comment} ${c.gapNumber} ${c.gapLabel}`.toLowerCase().includes(q)) return false;
+    return (!f.type || c.type === f.type) && (!f.status || c.status === f.status) && (!f.result || c.result === f.result) && (!f.gap || gapOf(c) === f.gap);
+  }).sort((a, b) => (b.doneDate || b.plannedDate || '').localeCompare(a.doneDate || a.plannedDate || ''));   // ordre par défaut : date décroissante
+  const col = CTRL_COLS.find(x => x.key === sc.key);
+  if (col) {                                       // tri stable : à valeur égale, l'ordre par date est conservé
+    const m = sc.dir === 'asc' ? 1 : -1;
+    rows.sort((a, b) => {
+      const x = col.v(a), y = col.v(b);
+      if (x === '' && y === '') return 0; if (x === '') return 1; if (y === '') return -1;
+      return m * (typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y), 'fr', { numeric: true, sensitivity: 'base' }));
+    });
+  }
+  const th = c => {
+    const on = sc.key === c.key, arrow = on ? (sc.dir === 'asc' ? '▲' : '▼') : '↕';
+    return `<th aria-sort="${on ? (sc.dir === 'asc' ? 'ascending' : 'descending') : 'none'}"><button type="button" class="inline-flex items-center gap-1 font-semibold hover:text-slate-900 ${on ? 'text-sky-800' : ''}" data-act="ctrl-sort" data-key="${c.key}" title="Trier par « ${esc(c.label)} »">${c.label}<span class="${on ? '' : 'opacity-40'}" aria-hidden="true">${arrow}</span></button></th>`;
+  };
+  return `<table class="w-full min-w-[1100px]"><thead><tr>${CTRL_COLS.map(th).join('')}</tr></thead><tbody>
+  ${rows.map(c => { const e = espById(c.espId), g = gapOf(c) === 'Oui';
+    return `<tr data-act="ctrl-open" data-id="${c.id}"><td class="font-medium">${esc(e?.tag || '(supprimé)')}</td><td>${esc(e?.name || '—')}</td><td>${esc(c.type)}</td><td>${ctrlStatusBadge(c.status)}</td>
+    <td>${fmtDate(c.plannedDate)}</td><td>${fmtDate(c.doneDate)}</td><td>${esc(c.inspector)}</td><td>${resultBadge(c.result)}</td>
+    <td>${badge(g ? 'Oui' : 'Non', g ? 'red' : 'gray')}${g && (c.gapNumber || c.gapLabel) ? `<div class="text-xs text-slate-600 mt-1">${c.gapNumber ? `<span class="font-medium">${esc(c.gapNumber)}</span>` : ''}${c.gapNumber && c.gapLabel ? ' · ' : ''}${esc(c.gapLabel)}</div>` : ''}</td>
+    <td>${(c.attachments || []).length}</td></tr>`; }).join('')
+    || `<tr><td colspan="10" class="text-slate-500">Aucun contrôle enregistré.</td></tr>`}</tbody></table>`;
 }
 
 let ctrlAtt = [];   // pièces jointes en cours d'édition
@@ -741,6 +776,11 @@ function openCtrl(id, espId, preset) {
       ${inp('doneDate', 'Date de réalisation', c.doneDate, { type: 'date' })}
       ${inp('inspector', 'Organisme / inspecteur', c.inspector)}
       ${sel('result', 'Résultat', RESULTS, c.result)}
+      ${sel('gapRequired', 'Écart à traiter', GAP_OPTS, gapOf(c), { blank: false })}
+      <div class="hidden sm:col-span-2 grid sm:grid-cols-[1fr_2fr] gap-3 rounded-md border border-red-200 bg-red-50/50 p-3" id="gap-fields">
+        ${inp('gapNumber', "N° d'écart (autre outil)", c.gapNumber)}
+        ${inp('gapLabel', "Désignation de l'écart (succincte)", c.gapLabel, { attr: 'maxlength="200"' })}
+      </div>
       <label class="block text-sm font-medium sm:col-span-2">Commentaire / réserves<textarea class="fld" name="comment" rows="3">${esc(c.comment)}</textarea></label>
       <div class="sm:col-span-2">
         <div class="text-sm font-medium">Pièces jointes (rapports, certificats)</div>
@@ -758,6 +798,8 @@ function openCtrl(id, espId, preset) {
       ${id && can('enter_control') && !locked ? `<button class="btn btn-danger" type="button" data-act="ctrl-delete" data-id="${id}">Supprimer</button>` : ''}
     </div>
   </form>`);
+  const showGap = () => $('#gap-fields').classList.toggle('hidden', $('[name=gapRequired]').value !== 'Oui');
+  $('[name=gapRequired]').addEventListener('change', showGap); showGap();
 }
 
 /* =====================================================================
@@ -1034,6 +1076,11 @@ document.addEventListener('click', async ev => {
   try {
     switch (el.dataset.act) {
       case 'close': closeModal(); break;
+      case 'ctrl-sort': {   // tri : 1er clic croissant, 2e clic décroissant, 3e clic retour à l'ordre par défaut (date)
+        const k = el.dataset.key, s = state.sCtrl;
+        if (s.key !== k) { s.key = k; s.dir = 'asc'; } else if (s.dir === 'asc') s.dir = 'desc'; else { s.key = ''; s.dir = 'asc'; }
+        $('#ctrl-table').innerHTML = ctrlTable();
+        $(`#ctrl-table [data-key="${k}"]`)?.focus(); break; }
       case 'logout': logout(); break;
       case 'pwd': openPwd(); break;
       case 'export-csv': exportCsv(); break;
@@ -1118,7 +1165,7 @@ document.addEventListener('submit', async ev => {
       closeModal(); toast(changed ? 'ESP enregistré' : 'Aucune modification', changed ? 'ok' : 'info');
     }
     if (kind === 'ctrl') {
-      const id = form.dataset.id || db.collection('controls').doc().id, before = form.dataset.id ? state.controls.find(c => c.id === id) : null;
+      const id = form.dataset.id || db.collection('controls').doc().id, before = form.dataset.id ? { gapRequired: 'Non', gapNumber: '', gapLabel: '', ...state.controls.find(c => c.id === id) } : null;   // anciens contrôles : écart = « Non »
       const st = g('status');
       if (st !== 'Planifié' && !g('doneDate')) throw new Error('La date de réalisation est obligatoire pour un contrôle réalisé ou clôturé.');
       if (st === 'Clôturé' && !g('result')) throw new Error('Le résultat est obligatoire pour clôturer un contrôle.');
@@ -1133,6 +1180,7 @@ document.addEventListener('submit', async ev => {
       const closing = st === 'Clôturé' && before?.status !== 'Clôturé';
       const data = { espId: g('espId'), type: g('type'), status: st, plannedDate: g('plannedDate'), doneDate: g('doneDate'), inspector: g('inspector'),
         result: g('result'), comment: g('comment'), attachments: att,
+        gapRequired: g('gapRequired') === 'Oui' ? 'Oui' : 'Non', gapNumber: g('gapRequired') === 'Oui' ? g('gapNumber') : '', gapLabel: g('gapRequired') === 'Oui' ? g('gapLabel') : '',
         validatedBy: closing ? state.user.username : (st === 'Clôturé' ? before?.validatedBy || '' : ''),
         validatedAt: closing ? todayISO() : (st === 'Clôturé' ? before?.validatedAt || '' : '') };
       const e = espById(data.espId);
