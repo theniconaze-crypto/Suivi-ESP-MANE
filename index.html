@@ -87,6 +87,8 @@ const CATEGORIES  = ['Art. 4§3 (SEP)', 'I', 'II', 'III', 'IV'];
 const ATEX_ZONES  = ['Hors zone', 'Zone 1', 'Zone 2', 'Zone 21', 'Zone 22'];
 const STATUSES    = ['En service', 'À l\'arrêt / Consigné', 'Isolé', 'Hors service / Rébuté'];
 const OUT_STATUS  = 'Hors service / Rébuté';               // exclu du suivi des échéances
+const PLAN_HORIZON_DAYS = 90;                               // une échéance échue ou à ≤ N jours doit avoir un contrôle planifié
+const PLAN_FILTER = 'Échéance sans planification';         // valeur du filtre de la liste des ESP
 const CTRL_TYPES  = ['Visite périodique', 'Requalification périodique', 'Contrôle après intervention notable'];
 const CTRL_STATUS = ['Planifié', 'Réalisé', 'Clôturé'];
 // Services / pôles proposés par défaut (la liste s'enrichit automatiquement des pôles saisis sur les ESP)
@@ -152,7 +154,7 @@ async function hashPw(pw, salt) {
    4. ÉTAT GLOBAL & FIREBASE
    ===================================================================== */
 const state = { user: null, esp: [], controls: [], audit: [], users: [], route: 'dashboard',
-  fDash: { pole: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' };
+  fDash: { pole: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' };
 let db, auth, storage, FV; const unsubs = []; let charts = [];
 const app = $('#app');
 
@@ -186,12 +188,29 @@ function dueOf(e) {
   const rpDue = (lastRP || base) && e.rpMonths > 0 ? addMonths(lastRP || base, +e.rpMonths) : null;
   const next = [ipDue, rpDue].filter(Boolean).sort()[0] || null;
   const nextType = next ? (next === ipDue ? 'Visite périodique' : 'Requalification périodique') : null;
-  return { lastIP, lastRP, ipDue, rpDue, next, nextType, days: next ? daysUntil(next) : null, monitored: e.status !== OUT_STATUS };
+  const r = { lastIP, lastRP, ipDue, rpDue, next, nextType, days: next ? daysUntil(next) : null, monitored: e.status !== OUT_STATUS };
+  return Object.assign(r, planOf(e, r));
+}
+/* Planification : une échéance échue ou à ≤ PLAN_HORIZON_DAYS est « sans planification » si aucun contrôle au statut « Planifié »,
+   daté d'aujourd'hui ou du futur, ne la couvre. Une requalification couvre aussi la visite périodique, pas l'inverse.
+   gap = { type, due, days, stale } (stale : un contrôle « Planifié » existe mais sa date est dépassée ou absente) ; planned = 1re date planifiée à venir. */
+function planOf(e, d) {
+  if (!d.monitored) return { gap: null, planned: null };
+  const today = todayISO();
+  const open = state.controls.filter(c => c.espId === e.id && c.status === 'Planifié');
+  const future = open.filter(c => c.plannedDate && c.plannedDate >= today);
+  const match = (c, t) => c.type === t || (t === 'Visite périodique' && c.type === 'Requalification périodique');
+  const gap = [['Requalification périodique', d.rpDue], ['Visite périodique', d.ipDue]]
+    .filter(([t, due]) => due && daysUntil(due) <= PLAN_HORIZON_DAYS && !future.some(c => match(c, t)))
+    .map(([type, due]) => ({ type, due, days: daysUntil(due), stale: open.some(c => match(c, type)) }))
+    .sort((a, b) => a.due.localeCompare(b.due))[0] || null;
+  return { gap, planned: future.map(c => c.plannedDate).sort()[0] || null };
 }
 const BADGE = {
   red: 'bg-red-100 text-red-800 ring-red-300', orange: 'bg-orange-100 text-orange-800 ring-orange-300',
   yellow: 'bg-yellow-100 text-yellow-800 ring-yellow-300', green: 'bg-emerald-100 text-emerald-800 ring-emerald-300',
-  gray: 'bg-slate-100 text-slate-600 ring-slate-300', blue: 'bg-sky-100 text-sky-800 ring-sky-300'
+  gray: 'bg-slate-100 text-slate-600 ring-slate-300', blue: 'bg-sky-100 text-sky-800 ring-sky-300',
+  violet: 'bg-violet-100 text-violet-800 ring-violet-300'
 };
 const badge = (t, c) => `<span class="inline-block whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${BADGE[c]}">${esc(t)}</span>`;
 function dueBadge(d) {
@@ -202,6 +221,13 @@ function dueBadge(d) {
   if (d.days <= 90) return badge(`Dans ${d.days} j`, 'yellow');
   return badge('Conforme', 'green');
 }
+/* Indicateur « échéance sans planification » (liste + tableau de bord) */
+function planBadge(d) {
+  if (!d.monitored) return '<span class="text-slate-500">—</span>';
+  if (d.gap) return `${badge(d.gap.stale ? 'Planification dépassée' : 'À planifier', 'violet')}<div class="text-xs text-slate-500 mt-0.5">${esc(d.gap.type)} · ${fmtDate(d.gap.due)}</div>`;
+  return d.planned ? `<span class="text-xs text-slate-600">Planifié le ${fmtDate(d.planned)}</span>` : '<span class="text-slate-500">—</span>';
+}
+const gapCell = d => d.gap ? 'border-l-4 border-l-violet-500' : '';   // repère visuel en début de ligne
 const dueClass = d => !d.monitored || d.days === null ? 'gray' : d.days < 0 ? 'red' : d.days <= 30 ? 'orange' : d.days <= 90 ? 'yellow' : 'green';
 
 /* =====================================================================
@@ -380,12 +406,20 @@ function viewDashboard() {
   const card = (label, val, c, hint) => `<div class="bg-white rounded-lg shadow-sm border-l-4 ${c} p-4"><div class="text-3xl font-semibold">${val}</div><div class="text-sm font-medium mt-1">${label}</div><div class="text-xs text-slate-500">${hint}</div></div>`;
   const top = mon.filter(x => x.d.next).sort((a, b) => a.d.next.localeCompare(b.d.next)).slice(0, 10);
   const poleOpts = userPoles().length ? userPoles() : allPoles();
+  const gaps = mon.filter(x => x.d.gap), gapLate = gaps.filter(x => x.d.gap.days < 0).length;
+  const planBanner = !mon.length ? '' : gaps.length
+    ? `<div class="mb-3 rounded-lg border border-violet-300 bg-violet-50 p-4 flex flex-wrap items-center justify-between gap-3" role="status">
+        <div><div class="text-sm font-semibold text-violet-900">${gaps.length} équipement(s) avec une échéance sans planification</div>
+        <div class="text-xs text-violet-800 mt-0.5">${gapLate ? `dont ${gapLate} déjà échu(s) · ` : ''}échéance échue ou à ${PLAN_HORIZON_DAYS} jours maximum, sans contrôle planifié à venir</div></div>
+        <button class="btn btn-primary" data-act="plan-filter">Voir la liste</button></div>`
+    : `<div class="mb-3 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm text-emerald-900" role="status">Toutes les échéances échues ou à ${PLAN_HORIZON_DAYS} jours maximum sont planifiées.</div>`;
   return `
   <div class="flex flex-wrap items-end justify-between gap-3 mb-4">
     <h1 class="text-xl font-semibold">Tableau de bord${state.fDash.pole ? ' – ' + esc(state.fDash.pole) : ''}</h1>
     <label class="text-sm font-medium">Service / Pôle
       <select class="fld min-w-[14rem]" data-filter="fDash.pole">${opt(poleOpts, state.fDash.pole, 'Tous les pôles')}</select></label>
   </div>
+  ${planBanner}
   <div class="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
     ${card('ESP au parc', base.length, 'border-slate-400', 'tous statuts confondus')}
     ${card('En service', base.filter(e => e.status === 'En service').length, 'border-emerald-500', 'statut « En service »')}
@@ -401,9 +435,9 @@ function viewDashboard() {
   </div>
   <div class="bg-white rounded-lg shadow-sm mt-5 overflow-x-auto">
     <h2 class="text-sm font-semibold p-4 pb-2">Échéances prioritaires</h2>
-    <table class="w-full min-w-[720px]"><thead><tr><th>Tag</th><th>Pôle</th><th>Prochain contrôle</th><th>Échéance</th><th>État</th></tr></thead><tbody>
-    ${top.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}"><td class="font-medium">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.name || e.type)}</div></td><td>${esc(e.pole) || '—'}</td><td>${esc(d.nextType)}</td><td>${fmtDate(d.next)}</td><td>${dueBadge(d)}</td></tr>`).join('')
-      || `<tr><td colspan="5" class="text-slate-500">Aucun équipement suivi. ${state.user.role === 'admin' ? '<button class="underline text-sky-700" data-act="demo-load">Charger les données de démonstration</button>' : "Ajoutez un ESP depuis l'onglet Équipements."}</td></tr>`}
+    <table class="w-full min-w-[820px]"><thead><tr><th>Tag</th><th>Pôle</th><th>Prochain contrôle</th><th>Échéance</th><th>État</th><th>Planification</th></tr></thead><tbody>
+    ${top.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}"><td class="font-medium ${gapCell(d)}">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.name || e.type)}</div></td><td>${esc(e.pole) || '—'}</td><td>${esc(d.nextType)}</td><td>${fmtDate(d.next)}</td><td>${dueBadge(d)}</td><td>${planBadge(d)}</td></tr>`).join('')
+      || `<tr><td colspan="6" class="text-slate-500">Aucun équipement suivi. ${state.user.role === 'admin' ? '<button class="underline text-sky-700" data-act="demo-load">Charger les données de démonstration</button>' : "Ajoutez un ESP depuis l'onglet Équipements."}</td></tr>`}
     </tbody></table></div>`;
 }
 function drawCharts() {
@@ -439,12 +473,13 @@ function viewEsp() {
       ${can('edit_esp') ? `<button class="btn btn-primary" data-act="esp-new">Ajouter un ESP</button>` : ''}
     </div>
   </div>
-  <div class="bg-white rounded-lg shadow-sm p-3 grid sm:grid-cols-2 lg:grid-cols-5 gap-3">
+  <div class="bg-white rounded-lg shadow-sm p-3 grid sm:grid-cols-2 lg:grid-cols-6 gap-3">
     <input class="fld !mt-0" placeholder="Rechercher (tag, désignation, fluide, lieu…)" value="${esc(f.q)}" data-filter="fEsp.q">
     <select class="fld !mt-0" data-filter="fEsp.pole">${opt(rp.length ? rp : allPoles(), f.pole, 'Tous les pôles')}</select>
     <select class="fld !mt-0" data-filter="fEsp.status">${opt(STATUSES, f.status, 'Tous les statuts')}</select>
     <select class="fld !mt-0" data-filter="fEsp.atex">${opt(ATEX_ZONES, f.atex, 'Toutes les zones ATEX')}</select>
     <select class="fld !mt-0" data-filter="fEsp.due">${opt(['Échu', '≤ 30 jours', '≤ 90 jours', 'Conforme'], f.due, 'Toutes les échéances')}</select>
+    <select class="fld !mt-0" data-filter="fEsp.plan">${opt([PLAN_FILTER], f.plan, 'Toutes les planifications')}</select>
   </div>
   <div id="esp-table" class="bg-white rounded-lg shadow-sm mt-3 overflow-x-auto">${espTable()}</div>`;
 }
@@ -454,6 +489,7 @@ function filteredEsp() {
     if (q && !`${e.tag} ${e.name} ${e.serial} ${e.fluid} ${e.manufacturer} ${e.pole} ${e.building} ${e.workshop} ${e.location}`.toLowerCase().includes(q)) return false;
     if (f.pole && e.pole !== f.pole) return false;
     if (f.status && e.status !== f.status) return false;
+    if (f.plan === PLAN_FILTER && !d.gap) return false;
     if (f.atex && e.atex !== f.atex) return false;
     if (f.due) {
       if (!d.monitored || d.days === null) return false;
@@ -467,21 +503,21 @@ function filteredEsp() {
 }
 function espTable() {
   const rows = filteredEsp();
-  return `<table class="w-full min-w-[1100px]"><thead><tr><th>Tag / désignation</th><th>Pôle</th><th>Type</th><th>Cat.</th><th>Fluide</th><th>Zone ATEX</th><th>Statut</th><th>Localisation</th><th>Prochaine échéance</th><th>État</th></tr></thead><tbody>
+  return `<table class="w-full min-w-[1200px]"><thead><tr><th>Tag / désignation</th><th>Pôle</th><th>Type</th><th>Cat.</th><th>Fluide</th><th>Zone ATEX</th><th>Statut</th><th>Localisation</th><th>Prochaine échéance</th><th>État</th><th>Planification</th></tr></thead><tbody>
   ${rows.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}">
-    <td class="font-medium">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.name || e.serial)}</div></td>
+    <td class="font-medium ${gapCell(d)}">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.name || e.serial)}</div></td>
     <td>${esc(e.pole) || '—'}</td><td>${esc(e.type)}</td><td>${esc(e.category)}</td><td>${esc(e.fluid)}</td>
     <td>${e.atex && e.atex !== 'Hors zone' ? badge(e.atex, 'blue') : '<span class="text-slate-500">Hors zone</span>'}</td>
     <td>${esc(e.status)}</td><td>${esc([e.building, e.workshop].filter(Boolean).join(' / '))}</td>
-    <td>${d.next ? `${fmtDate(d.next)}<div class="text-xs text-slate-500">${esc(d.nextType)}</div>` : '—'}</td><td>${dueBadge(d)}</td></tr>`).join('')
-    || `<tr><td colspan="10" class="text-slate-500">Aucun équipement ne correspond à ces critères.</td></tr>`}
+    <td>${d.next ? `${fmtDate(d.next)}<div class="text-xs text-slate-500">${esc(d.nextType)}</div>` : '—'}</td><td>${dueBadge(d)}</td><td>${planBadge(d)}</td></tr>`).join('')
+    || `<tr><td colspan="11" class="text-slate-500">Aucun équipement ne correspond à ces critères.</td></tr>`}
   </tbody></table><div class="px-3 py-2 text-xs text-slate-500 border-t">${rows.length} équipement(s)</div>`;
 }
 function exportCsv() {
   const cols = ['tag', 'name', 'pole', 'serial', 'manufacturer', 'year', 'category', 'type', 'fluid', 'fluidGroup', 'ps', 'volume', 'dn', 'atex', 'status', 'building', 'workshop', 'location', 'commissioningDate'];
-  const head = cols.map(c => FL[c]).concat(['Prochaine échéance', 'Type échéance']);
+  const head = cols.map(c => FL[c]).concat(['Prochaine échéance', 'Type échéance', PLAN_FILTER]);
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const lines = filteredEsp().map(({ e, d }) => cols.map(c => q(e[c])).concat([q(d.next), q(d.nextType)]).join(';'));
+  const lines = filteredEsp().map(({ e, d }) => cols.map(c => q(e[c])).concat([q(d.next), q(d.nextType), q(d.gap ? 'Oui' : 'Non')]).join(';'));
   const blob = new Blob(['\ufeff' + [head.map(q).join(';'), ...lines].join('\r\n')], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `esp_${todayISO()}.csv`; a.click();
 }
@@ -906,6 +942,8 @@ document.addEventListener('click', async ev => {
       case 'logout': logout(); break;
       case 'pwd': openPwd(); break;
       case 'export-csv': exportCsv(); break;
+      case 'plan-filter':   // depuis le tableau de bord : liste filtrée sur les échéances sans planification (même pôle)
+        state.fEsp = { q: '', status: '', atex: '', due: '', pole: state.fDash.pole, plan: PLAN_FILTER }; location.hash = '#esp'; break;
       case 'esp-new': openEsp(null); break;
       case 'esp-open': openEsp(id); break;
       case 'esp-delete': {
