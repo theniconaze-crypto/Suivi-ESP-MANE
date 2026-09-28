@@ -779,7 +779,7 @@ function ctrlTable() {
   };
   return `<table class="w-full min-w-[1100px]"><thead><tr>${CTRL_COLS.map(th).join('')}</tr></thead><tbody>
   ${rows.map(c => { const e = espById(c.espId), g = gapOf(c) === 'Oui';
-    return `<tr data-act="ctrl-open" data-id="${c.id}"><td class="font-medium">${esc(e?.tag || '(supprimé)')}</td><td>${esc(e?.name || '—')}</td><td>${esc(c.type)}</td><td>${ctrlStatusBadge(c.status)}</td>
+    return `<tr data-act="ctrl-open" data-id="${c.id}"><td class="font-medium whitespace-nowrap">${esc(e?.tag || '(supprimé)')}</td><td>${esc(e?.name || '—')}</td><td>${esc(c.type)}</td><td>${ctrlStatusBadge(c.status)}</td>
     <td>${fmtDate(c.plannedDate)}</td><td>${fmtDate(c.doneDate)}</td><td>${esc(c.inspector)}</td><td>${resultBadge(c.result)}</td>
     <td>${badge(g ? 'Oui' : 'Non', g ? 'red' : 'gray')}${g ? gapCellInfo(c) : ''}</td>
     <td>${(c.attachments || []).length}</td></tr>`; }).join('')
