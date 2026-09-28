@@ -89,6 +89,8 @@ const STATUSES    = ['En service', 'À l\'arrêt / Consigné', 'Isolé', 'Hors s
 const OUT_STATUS  = 'Hors service / Rébuté';               // exclu du suivi des échéances
 const CTRL_TYPES  = ['Visite périodique', 'Requalification périodique', 'Contrôle après intervention notable'];
 const CTRL_STATUS = ['Planifié', 'Réalisé', 'Clôturé'];
+// Services / pôles proposés par défaut (la liste s'enrichit automatiquement des pôles saisis sur les ESP)
+const POLES_DEFAULT = ['Extraction & Distillation', 'Synthèse aromatique', 'Formulation & Mélange', 'Conditionnement', 'Utilités', 'Laboratoire & Pilote'];
 const RESULTS     = ['Conforme', 'Conforme avec réserves', 'Non conforme'];
 // Périodicités indicatives en mois [visite/inspection, requalification].
 // À VALIDER selon l'arrêté du 20/11/2017 et le plan d'inspection de l'établissement ; modifiables par équipement.
@@ -97,7 +99,7 @@ const DEFAULT_PERIODS = {
   'Tuyauterie': [72, 144], 'Accessoire de sécurité': [48, 120], 'Autre': [48, 120]
 };
 const FL = { // libellés des champs pour le journal d'audit
-  tag: 'N° inventaire / Tag', serial: 'N° de série', manufacturer: 'Fabricant', year: 'Année de construction',
+  tag: 'N° inventaire / Tag', name: 'Désignation', pole: 'Service / Pôle', poles: 'Pôles autorisés', serial: 'N° de série', manufacturer: 'Fabricant', year: 'Année de construction',
   category: 'Catégorie DESP', type: 'Type', fluid: 'Fluide', fluidGroup: 'Groupe de fluide', ps: 'PS (bar)',
   volume: 'Volume (L)', dn: 'DN', atex: 'Zone ATEX', status: 'Statut', building: 'Bâtiment', workshop: 'Atelier',
   location: 'Localisation précise', commissioningDate: 'Mise en service', ipMonths: 'Périodicité visite (mois)',
@@ -150,7 +152,7 @@ async function hashPw(pw, salt) {
    4. ÉTAT GLOBAL & FIREBASE
    ===================================================================== */
 const state = { user: null, esp: [], controls: [], audit: [], users: [], route: 'dashboard',
-  fEsp: { q: '', status: '', atex: '', due: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' };
+  fDash: { pole: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' };
 let db, auth, storage, FV; const unsubs = []; let charts = [];
 const app = $('#app');
 
@@ -161,6 +163,11 @@ function initFirebase() {
 }
 const can = p => !!state.user && (state.user.role === 'admin' || !!state.user.permissions?.[p]);
 const espById = id => state.esp.find(e => e.id === id);
+/* Visibilité par service / pôle : liste vide = tous les pôles ; l'admin voit tout */
+const userPoles = () => (!state.user || state.user.role === 'admin') ? [] : (state.user.poles || []);
+const visibleEsp = () => { const p = userPoles(); return p.length ? state.esp.filter(e => p.includes(e.pole)) : state.esp; };
+const visibleIds = () => new Set(visibleEsp().map(e => e.id));
+const allPoles = () => [...new Set([...POLES_DEFAULT, ...state.esp.map(e => e.pole).filter(Boolean)])].sort((a, b) => a.localeCompare(b, 'fr'));
 
 /* =====================================================================
    5. CALCUL DES ÉCHÉANCES RÉGLEMENTAIRES
@@ -202,7 +209,7 @@ const dueClass = d => !d.monitored || d.days === null ? 'gray' : d.days < 0 ? 'r
    ===================================================================== */
 const normV = v => {
   if (v == null || v === '') return '';
-  if (Array.isArray(v)) return v.map(a => a.name).join(', ');
+  if (Array.isArray(v)) return v.map(a => typeof a === 'string' ? a : a.name).join(', ');
   if (typeof v === 'object') return Object.entries(v).filter(([, x]) => x).map(([k]) => (PERMS.find(p => p.key === k) || {}).label || k).join(', ');
   return String(v);
 };
@@ -274,9 +281,9 @@ function startListeners() {
   // Le profil courant est surveillé : changement de droits ou désactivation pris en compte en direct
   unsubs.push(db.collection('users').doc(state.user.username).onSnapshot(s => {
     if (!s.exists || s.data().active === false) { toast('Session terminée : compte supprimé ou désactivé.', 'err'); return logout(); }
-    const prev = JSON.stringify(state.user.permissions);
+    const sig = u => JSON.stringify([u.permissions, u.poles]); const prev = sig(state.user);
     state.user = s.data();
-    if (prev !== JSON.stringify(state.user.permissions)) setTimeout(() => { startListeners(); renderShell(); }, 0);
+    if (prev !== sig(state.user)) setTimeout(() => { startListeners(); renderShell(); }, 0);
   }, err));
   unsubs.push(db.collection('esp').onSnapshot(s => { state.esp = list(s); renderView(); }, err));
   unsubs.push(db.collection('controls').onSnapshot(s => { state.controls = list(s); renderView(); }, err));
@@ -364,38 +371,50 @@ window.addEventListener('hashchange', renderShell);
 /* =====================================================================
    9. TABLEAU DE BORD
    ===================================================================== */
+function dashEsp() { const p = state.fDash.pole; return visibleEsp().filter(e => !p || e.pole === p); }
 function viewDashboard() {
-  const rows = state.esp.map(e => ({ e, d: dueOf(e) })), mon = rows.filter(x => x.d.monitored);
+  const base = dashEsp();
+  const rows = base.map(e => ({ e, d: dueOf(e) })), mon = rows.filter(x => x.d.monitored);
   const within = n => mon.filter(x => x.d.days !== null && x.d.days >= 0 && x.d.days <= n).length;
   const overdue = mon.filter(x => x.d.days !== null && x.d.days < 0).length;
   const card = (label, val, c, hint) => `<div class="bg-white rounded-lg shadow-sm border-l-4 ${c} p-4"><div class="text-3xl font-semibold">${val}</div><div class="text-sm font-medium mt-1">${label}</div><div class="text-xs text-slate-500">${hint}</div></div>`;
   const top = mon.filter(x => x.d.next).sort((a, b) => a.d.next.localeCompare(b.d.next)).slice(0, 10);
+  const poleOpts = userPoles().length ? userPoles() : allPoles();
   return `
-  <h1 class="text-xl font-semibold mb-4">Tableau de bord</h1>
+  <div class="flex flex-wrap items-end justify-between gap-3 mb-4">
+    <h1 class="text-xl font-semibold">Tableau de bord${state.fDash.pole ? ' – ' + esc(state.fDash.pole) : ''}</h1>
+    <label class="text-sm font-medium">Service / Pôle
+      <select class="fld min-w-[14rem]" data-filter="fDash.pole">${opt(poleOpts, state.fDash.pole, 'Tous les pôles')}</select></label>
+  </div>
   <div class="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3">
-    ${card('ESP au parc', state.esp.length, 'border-slate-400', 'tous statuts confondus')}
-    ${card('En service', state.esp.filter(e => e.status === 'En service').length, 'border-emerald-500', 'statut « En service »')}
+    ${card('ESP au parc', base.length, 'border-slate-400', 'tous statuts confondus')}
+    ${card('En service', base.filter(e => e.status === 'En service').length, 'border-emerald-500', 'statut « En service »')}
     ${card('En retard', overdue, 'border-red-600', 'échéance dépassée')}
     ${card('À 30 jours', within(30), 'border-orange-500', 'échéances ≤ 30 j')}
     ${card('À 60 jours', within(60), 'border-yellow-500', 'échéances ≤ 60 j')}
     ${card('À 90 jours', within(90), 'border-sky-500', 'échéances ≤ 90 j')}
   </div>
   <p class="text-xs text-slate-500 mt-2">Les équipements « Hors service / Rébuté » sont exclus du suivi. Les compteurs d'échéance sont cumulatifs (≤ 90 j inclut ≤ 30 j).</p>
-  <div class="grid lg:grid-cols-3 gap-4 mt-5">
-    ${['Répartition par type', 'Répartition par zone ATEX', 'Répartition par statut'].map((t, i) => `
+  <div class="grid md:grid-cols-2 xl:grid-cols-4 gap-4 mt-5">
+    ${['Répartition par type', 'Répartition par zone ATEX', 'Répartition par statut', 'Répartition par service / pôle'].map((t, i) => `
       <div class="bg-white rounded-lg shadow-sm p-4"><h2 class="text-sm font-semibold mb-2">${t}</h2><div class="relative h-56"><canvas id="ch${i}"></canvas></div></div>`).join('')}
   </div>
   <div class="bg-white rounded-lg shadow-sm mt-5 overflow-x-auto">
     <h2 class="text-sm font-semibold p-4 pb-2">Échéances prioritaires</h2>
-    <table class="w-full min-w-[640px]"><thead><tr><th>Tag</th><th>Type</th><th>Prochain contrôle</th><th>Échéance</th><th>État</th></tr></thead><tbody>
-    ${top.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}"><td class="font-medium">${esc(e.tag)}</td><td>${esc(e.type)}</td><td>${esc(d.nextType)}</td><td>${fmtDate(d.next)}</td><td>${dueBadge(d)}</td></tr>`).join('')
-      || `<tr><td colspan="5" class="text-slate-500">Aucun équipement suivi. Ajoutez un ESP depuis l'onglet Équipements.</td></tr>`}
+    <table class="w-full min-w-[720px]"><thead><tr><th>Tag</th><th>Pôle</th><th>Prochain contrôle</th><th>Échéance</th><th>État</th></tr></thead><tbody>
+    ${top.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}"><td class="font-medium">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.name || e.type)}</div></td><td>${esc(e.pole) || '—'}</td><td>${esc(d.nextType)}</td><td>${fmtDate(d.next)}</td><td>${dueBadge(d)}</td></tr>`).join('')
+      || `<tr><td colspan="5" class="text-slate-500">Aucun équipement suivi. ${state.user.role === 'admin' ? '<button class="underline text-sky-700" data-act="demo-load">Charger les données de démonstration</button>' : "Ajoutez un ESP depuis l'onglet Équipements."}</td></tr>`}
     </tbody></table></div>`;
 }
 function drawCharts() {
   if (!window.Chart) return;
-  const pal = ['#0e6a8a', '#d97706', '#4d7c0f', '#9333ea', '#be123c', '#64748b'];
-  const count = (f, order) => { const m = {}; state.esp.forEach(e => { const k = f(e) || 'Non renseigné'; m[k] = (m[k] || 0) + 1; }); const ks = order ? order.filter(k => m[k]) .concat(Object.keys(m).filter(k => !order.includes(k))) : Object.keys(m); return { labels: ks, data: ks.map(k => m[k]) }; };
+  const base = dashEsp();
+  const pal = ['#0e6a8a', '#d97706', '#4d7c0f', '#9333ea', '#be123c', '#64748b', '#0f766e', '#a16207'];
+  const count = (f, order) => {
+    const m = {}; base.forEach(e => { const k = f(e) || 'Non renseigné'; m[k] = (m[k] || 0) + 1; });
+    const ks = order ? order.filter(k => m[k]).concat(Object.keys(m).filter(k => !order.includes(k))) : Object.keys(m);
+    return { labels: ks, data: ks.map(k => m[k]) };
+  };
   const mk = (id, type, o) => { const c = $('#' + id); if (!c) return;
     charts.push(new Chart(c, { type, data: { labels: o.labels, datasets: [{ data: o.data, backgroundColor: pal, borderWidth: 1 }] },
       options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: type === 'doughnut', position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } } },
@@ -403,6 +422,7 @@ function drawCharts() {
   mk('ch0', 'doughnut', count(e => e.type));
   mk('ch1', 'bar', count(e => e.atex, ATEX_ZONES));
   mk('ch2', 'doughnut', count(e => e.status, STATUSES));
+  mk('ch3', 'doughnut', count(e => e.pole));
 }
 
 /* =====================================================================
@@ -410,7 +430,7 @@ function drawCharts() {
    ===================================================================== */
 const opt = (arr, sel, blank) => (blank != null ? `<option value="">${blank}</option>` : '') + arr.map(x => `<option ${x === sel ? 'selected' : ''}>${esc(x)}</option>`).join('');
 function viewEsp() {
-  const f = state.fEsp;
+  const f = state.fEsp, rp = userPoles();
   return `
   <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
     <h1 class="text-xl font-semibold">Équipements sous pression</h1>
@@ -419,8 +439,9 @@ function viewEsp() {
       ${can('edit_esp') ? `<button class="btn btn-primary" data-act="esp-new">Ajouter un ESP</button>` : ''}
     </div>
   </div>
-  <div class="bg-white rounded-lg shadow-sm p-3 grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
-    <input class="fld !mt-0" placeholder="Rechercher (tag, série, fluide, lieu…)" value="${esc(f.q)}" data-filter="fEsp.q">
+  <div class="bg-white rounded-lg shadow-sm p-3 grid sm:grid-cols-2 lg:grid-cols-5 gap-3">
+    <input class="fld !mt-0" placeholder="Rechercher (tag, désignation, fluide, lieu…)" value="${esc(f.q)}" data-filter="fEsp.q">
+    <select class="fld !mt-0" data-filter="fEsp.pole">${opt(rp.length ? rp : allPoles(), f.pole, 'Tous les pôles')}</select>
     <select class="fld !mt-0" data-filter="fEsp.status">${opt(STATUSES, f.status, 'Tous les statuts')}</select>
     <select class="fld !mt-0" data-filter="fEsp.atex">${opt(ATEX_ZONES, f.atex, 'Toutes les zones ATEX')}</select>
     <select class="fld !mt-0" data-filter="fEsp.due">${opt(['Échu', '≤ 30 jours', '≤ 90 jours', 'Conforme'], f.due, 'Toutes les échéances')}</select>
@@ -429,8 +450,9 @@ function viewEsp() {
 }
 function filteredEsp() {
   const f = state.fEsp, q = f.q.toLowerCase();
-  return state.esp.map(e => ({ e, d: dueOf(e) })).filter(({ e, d }) => {
-    if (q && !`${e.tag} ${e.serial} ${e.fluid} ${e.manufacturer} ${e.building} ${e.workshop} ${e.location}`.toLowerCase().includes(q)) return false;
+  return visibleEsp().map(e => ({ e, d: dueOf(e) })).filter(({ e, d }) => {
+    if (q && !`${e.tag} ${e.name} ${e.serial} ${e.fluid} ${e.manufacturer} ${e.pole} ${e.building} ${e.workshop} ${e.location}`.toLowerCase().includes(q)) return false;
+    if (f.pole && e.pole !== f.pole) return false;
     if (f.status && e.status !== f.status) return false;
     if (f.atex && e.atex !== f.atex) return false;
     if (f.due) {
@@ -445,18 +467,18 @@ function filteredEsp() {
 }
 function espTable() {
   const rows = filteredEsp();
-  return `<table class="w-full min-w-[900px]"><thead><tr><th>Tag</th><th>Type</th><th>Cat.</th><th>Fluide</th><th>Zone ATEX</th><th>Statut</th><th>Localisation</th><th>Prochaine échéance</th><th>État</th></tr></thead><tbody>
+  return `<table class="w-full min-w-[1100px]"><thead><tr><th>Tag / désignation</th><th>Pôle</th><th>Type</th><th>Cat.</th><th>Fluide</th><th>Zone ATEX</th><th>Statut</th><th>Localisation</th><th>Prochaine échéance</th><th>État</th></tr></thead><tbody>
   ${rows.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}">
-    <td class="font-medium">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.serial)}</div></td>
-    <td>${esc(e.type)}</td><td>${esc(e.category)}</td><td>${esc(e.fluid)}</td>
+    <td class="font-medium">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.name || e.serial)}</div></td>
+    <td>${esc(e.pole) || '—'}</td><td>${esc(e.type)}</td><td>${esc(e.category)}</td><td>${esc(e.fluid)}</td>
     <td>${e.atex && e.atex !== 'Hors zone' ? badge(e.atex, 'blue') : '<span class="text-slate-500">Hors zone</span>'}</td>
     <td>${esc(e.status)}</td><td>${esc([e.building, e.workshop].filter(Boolean).join(' / '))}</td>
     <td>${d.next ? `${fmtDate(d.next)}<div class="text-xs text-slate-500">${esc(d.nextType)}</div>` : '—'}</td><td>${dueBadge(d)}</td></tr>`).join('')
-    || `<tr><td colspan="9" class="text-slate-500">Aucun équipement ne correspond à ces critères.</td></tr>`}
+    || `<tr><td colspan="10" class="text-slate-500">Aucun équipement ne correspond à ces critères.</td></tr>`}
   </tbody></table><div class="px-3 py-2 text-xs text-slate-500 border-t">${rows.length} équipement(s)</div>`;
 }
 function exportCsv() {
-  const cols = ['tag', 'serial', 'manufacturer', 'year', 'category', 'type', 'fluid', 'fluidGroup', 'ps', 'volume', 'dn', 'atex', 'status', 'building', 'workshop', 'location', 'commissioningDate'];
+  const cols = ['tag', 'name', 'pole', 'serial', 'manufacturer', 'year', 'category', 'type', 'fluid', 'fluidGroup', 'ps', 'volume', 'dn', 'atex', 'status', 'building', 'workshop', 'location', 'commissioningDate'];
   const head = cols.map(c => FL[c]).concat(['Prochaine échéance', 'Type échéance']);
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const lines = filteredEsp().map(({ e, d }) => cols.map(c => q(e[c])).concat([q(d.next), q(d.nextType)]).join(';'));
@@ -472,8 +494,16 @@ const inp = (name, label, val = '', o = {}) => `<label class="block text-sm font
 const sel = (name, label, arr, val, o = {}) => `<label class="block text-sm font-medium ${o.span || ''}">${label}${o.req ? ' *' : ''}
   <select class="fld" name="${name}" ${o.req ? 'required' : ''}>${opt(arr, val, o.blank === false ? null : '—')}</select></label>`;
 
+/* Champ Service / Pôle : liste fermée pour un utilisateur restreint, saisie assistée sinon */
+function poleField(e) {
+  const r = userPoles();
+  if (r.length) return sel('pole', 'Service / Pôle', r, e.pole, { req: 1, blank: false });
+  return `<label class="block text-sm font-medium">Service / Pôle *
+    <input class="fld" name="pole" list="poles-list" value="${esc(e.pole)}" required autocomplete="off">
+    <datalist id="poles-list">${allPoles().map(p => `<option value="${esc(p)}">`).join('')}</datalist></label>`;
+}
 function openEsp(id) {
-  const e = id ? espById(id) : { status: 'En service', atex: 'Hors zone', ipMonths: 48, rpMonths: 120 };
+  const e = id ? visibleEsp().find(x => x.id === id) : { status: 'En service', atex: 'Hors zone', ipMonths: 48, rpMonths: 120 };
   if (id && !e) return;
   const ro = !can('edit_esp'), d = id ? dueOf(e) : null;
   const ctrls = id ? state.controls.filter(c => c.espId === id).sort((a, b) => (b.doneDate || b.plannedDate || '').localeCompare(a.doneDate || a.plannedDate || '')) : [];
@@ -485,6 +515,8 @@ function openEsp(id) {
   <form data-form="esp" data-id="${id || ''}" class="p-4">
     <fieldset ${ro ? 'disabled' : ''} class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
       ${inp('tag', 'N° inventaire / Tag interne', e.tag, { req: 1 })}
+      ${inp('name', 'Désignation', e.name)}
+      ${poleField(e)}
       ${inp('serial', 'N° de série', e.serial)}
       ${inp('manufacturer', 'Fabricant', e.manufacturer)}
       ${inp('year', 'Année de construction', e.year, { type: 'number', attr: 'min="1900" max="2100"' })}
@@ -562,8 +594,9 @@ function viewControls() {
   <div id="ctrl-table" class="bg-white rounded-lg shadow-sm mt-3 overflow-x-auto">${ctrlTable()}</div>`;
 }
 function ctrlTable() {
-  const f = state.fCtrl, q = f.q.toLowerCase();
+  const f = state.fCtrl, q = f.q.toLowerCase(), vis = visibleIds();
   const rows = state.controls.filter(c => {
+    if (!vis.has(c.espId)) return false;
     const e = espById(c.espId);
     if (q && !`${e?.tag} ${c.inspector} ${c.comment}`.toLowerCase().includes(q)) return false;
     return (!f.type || c.type === f.type) && (!f.status || c.status === f.status);
@@ -583,7 +616,7 @@ function attList(ro) {
 }
 function openCtrl(id, espId) {
   const c = id ? state.controls.find(x => x.id === id) : { espId: espId || '', type: CTRL_TYPES[0], status: 'Planifié', plannedDate: todayISO() };
-  if (id && !c) return;
+  if (id && (!c || !visibleIds().has(c.espId))) return;
   const locked = c.status === 'Clôturé' && !can('validate_control');
   const ro = !can('enter_control') || locked;
   ctrlAtt = (c.attachments || []).map(a => ({ ...a }));
@@ -598,7 +631,7 @@ function openCtrl(id, espId) {
     <fieldset ${ro ? 'disabled' : ''} class="grid sm:grid-cols-2 gap-3">
       <label class="block text-sm font-medium sm:col-span-2">Équipement *
         <select class="fld" name="espId" required><option value="">— Choisir —</option>
-        ${[...state.esp].sort((a, b) => (a.tag || '').localeCompare(b.tag || '')).map(e => `<option value="${e.id}" ${e.id === c.espId ? 'selected' : ''}>${esc(e.tag)} — ${esc(e.type || '')}</option>`).join('')}</select></label>
+        ${[...visibleEsp()].sort((a, b) => (a.tag || '').localeCompare(b.tag || '')).map(e => `<option value="${e.id}" ${e.id === c.espId ? 'selected' : ''}>${esc(e.tag)} — ${esc(e.type || '')}</option>`).join('')}</select></label>
       ${sel('type', 'Type de contrôle', CTRL_TYPES, c.type, { req: 1, blank: false })}
       ${sel('status', 'Statut', statuses, c.status, { req: 1, blank: false })}
       ${inp('plannedDate', 'Date planifiée', c.plannedDate, { type: 'date' })}
@@ -644,7 +677,8 @@ function viewAudit() {
 }
 function auditBody() {
   const q = state.fAudit.toLowerCase();
-  const rows = state.audit.filter(a => !q || JSON.stringify(a).toLowerCase().includes(q));
+  const vis = userPoles().length ? visibleIds() : null;
+  const rows = state.audit.filter(a => (!vis || vis.has(a.espId)) && (!q || JSON.stringify(a).toLowerCase().includes(q)));
   return rows.length ? auditTable(rows) + `<div class="px-3 py-2 text-xs text-slate-500 border-t">${rows.length} entrée(s) affichée(s) — les 300 plus récentes.</div>` : '<div class="p-4 text-sm text-slate-500">Aucune entrée.</div>';
 }
 
@@ -654,11 +688,21 @@ function auditBody() {
 function viewUsers() {
   return `<div class="flex items-center justify-between mb-4"><h1 class="text-xl font-semibold">Utilisateurs</h1>
     <button class="btn btn-primary" data-act="user-new">Créer un utilisateur</button></div>
-  <div class="bg-white rounded-lg shadow-sm overflow-x-auto"><table class="w-full min-w-[640px]"><thead><tr><th>Identifiant</th><th>Nom</th><th>Statut</th><th>Droits</th></tr></thead><tbody>
+  <div class="bg-white rounded-lg shadow-sm overflow-x-auto"><table class="w-full min-w-[640px]"><thead><tr><th>Identifiant</th><th>Nom</th><th>Statut</th><th>Pôles visibles</th><th>Droits</th></tr></thead><tbody>
   ${[...state.users].sort((a, b) => a.id.localeCompare(b.id)).map(u => `<tr data-act="user-open" data-id="${u.id}"><td class="font-medium">${esc(u.username)}</td><td>${esc(u.displayName)}</td>
     <td>${u.role === 'admin' ? badge('Administrateur', 'blue') : u.active === false ? badge('Désactivé', 'gray') : badge('Actif', 'green')}</td>
+    <td class="text-xs">${u.role === 'admin' || !(u.poles || []).length ? 'Tous' : esc(u.poles.join(', '))}</td>
     <td class="text-xs text-slate-600">${u.role === 'admin' ? 'Tous les droits' : esc(normV(u.permissions)) || 'Aucun'}</td></tr>`).join('')}
-  </tbody></table></div>`;
+  </tbody></table></div>${adminCard()}`;
+}
+function adminCard() {
+  if (state.user.role !== 'admin') return '';
+  return `<div class="bg-white rounded-lg shadow-sm mt-5 p-4">
+    <h2 class="text-sm font-semibold">Données de l'application (administrateur)</h2>
+    <p class="text-sm text-slate-600 mt-1">Chargez un jeu d'exemples cohérent avec l'activité (ESP, contrôles, comptes de test) pour découvrir l'outil, ou effacez toutes les données. L'effacement demande le mot de passe administrateur.</p>
+    <div class="flex flex-wrap gap-2 mt-3">
+      <button class="btn btn-ghost" data-act="demo-load">Charger les données de démonstration</button>
+      <button class="btn btn-danger" data-act="reset-open">Réinitialiser toutes les données</button></div></div>`;
 }
 function openUser(id) {
   const u = id ? state.users.find(x => x.id === id) : { active: true, permissions: {}, role: 'user' };
@@ -682,6 +726,13 @@ function openUser(id) {
       </div>
       ${isAdmin ? '<p class="text-xs text-slate-500 mt-2">Le compte administrateur dispose de tous les droits (non modifiable).</p>' : ''}
     </fieldset>
+    <fieldset class="border rounded-md p-3" ${isAdmin ? 'disabled' : ''}>
+      <legend class="text-sm font-medium px-1">Visibilité par service / pôle</legend>
+      <p class="text-xs text-slate-500 mb-2">Aucun pôle coché = accès à tous les équipements. Sinon, l'utilisateur ne voit que les ESP (et leurs contrôles) des pôles cochés.</p>
+      <div class="grid sm:grid-cols-2 gap-2">
+      ${allPoles().map(p => `<label class="flex items-center gap-2 text-sm"><input type="checkbox" name="poles" value="${esc(p)}" ${(u.poles || []).includes(p) ? 'checked' : ''}> ${esc(p)}</label>`).join('')}
+      </div>
+    </fieldset>
     <div class="flex gap-2"><button class="btn btn-primary" type="submit">Enregistrer</button>
       ${id && !isAdmin ? `<button class="btn btn-danger" type="button" data-act="user-delete" data-id="${id}">Supprimer</button>` : ''}</div>
   </form>`);
@@ -692,6 +743,147 @@ function openPwd() {
     <label class="block text-sm font-medium">Mot de passe actuel<input class="fld" type="password" name="old" required autocomplete="current-password"></label>
     <label class="block text-sm font-medium">Nouveau mot de passe (8 caractères min.)<input class="fld" type="password" name="new" required minlength="8" autocomplete="new-password"></label>
     <button class="btn btn-primary" type="submit">Enregistrer</button></form>`);
+}
+
+/* =====================================================================
+   14b. DONNÉES DE DÉMONSTRATION & RÉINITIALISATION (administrateur)
+   ===================================================================== */
+const DEMO_PW = 'demo12345';
+const DEMO_ORGS = ['APAVE Sud-Europe', 'Bureau Veritas', 'SOCOTEC'];
+/* ipIn / rpIn = nombre de jours avant la prochaine échéance (négatif = échu). Les contrôles passés sont générés en conséquence. */
+function demoSpecs() {
+  const D = (tag, name, pole, type, category, fluid, fluidGroup, ps, volume, dn, atex, status, building, workshop, location, year, manufacturer, ipIn, rpIn, x = {}) =>
+    ({ tag, name, pole, type, category, fluid, fluidGroup, ps, volume, dn, atex, status, building, workshop, location, year, manufacturer, ipIn, rpIn, ...x });
+  const R = 'Récipient (gaz/vapeur)';
+  return [
+    // Utilités
+    D("RV-UT-001", "Ballon de détente vapeur", "Utilités", R, "III", "Vapeur d'eau", "2", 10, 800, null, "Hors zone", "En service", "Chaufferie", "Local chaufferie", "Sortie chaudière n°1", 2014, "Babcock Wanson", 52, 900),
+    D("RA-UT-002", "Réservoir air comprimé 3000 L", "Utilités", R, "II", "Air comprimé", "2", 11, 3000, null, "Hors zone", "En service", "Bâtiment technique", "Local compresseurs", "Aval sécheur d'air", 2016, "Atlas Copco", -35, 1500,
+      { nc: { d: 45, c: "Purgeur automatique défaillant, corrosion superficielle en pied de cuve : remise en conformité demandée avant nouvelle visite." } }),
+    D("RN-UT-003", "Réservoir azote tampon 500 L", "Utilités", R, "II", "Azote", "2", 12, 500, null, "Hors zone", "En service", "Bâtiment technique", "Local gaz", "Inertage des ateliers de synthèse", 2018, "Air Liquide", 400, 2300),
+    D("RF-UT-004", "Ballon liquide frigorigène R-134a", "Utilités", R, "III", "R-134a", "2", 16, 300, null, "Hors zone", "En service", "Bâtiment technique", "Salle groupe froid", "Groupe froid n°2", 2012, "Carrier", 15, 300,
+      { plan: [{ d: 14, type: "Visite périodique" }] }),
+    D("EC-UT-005", "Échangeur tubulaire vapeur / eau chaude", "Utilités", "Échangeur", "II", "Vapeur d'eau / eau chaude", "2", 8, 120, null, "Hors zone", "En service", "Chaufferie", "Local chaufferie", "Boucle d'eau chaude process", 2019, "Alfa Laval", 700, 2200),
+    D("TU-UT-006", "Réseau vapeur principal DN100", "Utilités", "Tuyauterie", "II", "Vapeur d'eau", "2", 10, null, 100, "Hors zone", "En service", "Extérieur", "Rack de tuyauteries", "De la chaufferie vers les bâtiments A, B et C", 2014, "Entreprise de tuyauterie Sud", 60, 1000),
+    // Extraction & Distillation
+    D("AC-EX-010", "Autoclave d'extraction CO2 supercritique 200 L", "Extraction & Distillation", "Réacteur", "IV", "CO2 supercritique", "2", 300, 200, null, "Hors zone", "En service", "Bâtiment A", "Extraction CO2", "Poste d'extraction n°1", 2017, "Separex", 20, 500,
+      { plan: [{ d: 12, type: "Visite périodique" }] }),
+    D("SP-EX-011", "Séparateur / détendeur CO2 150 L", "Extraction & Distillation", R, "III", "CO2", "2", 60, 150, null, "Hors zone", "En service", "Bâtiment A", "Extraction CO2", "Aval de l'autoclave AC-EX-010", 2017, "Separex", 130, 700),
+    D("CD-EX-012", "Condenseur de distillation huiles essentielles", "Extraction & Distillation", "Échangeur", "II", "Vapeur d'eau / huile essentielle", "2", 3, 60, null, "Zone 2", "En service", "Bâtiment A", "Distillation", "Colonne D2", 2015, "Alfa Laval", 200, 1100),
+    D("BO-EX-013", "Bouilleur / alambic vapeur 2000 L", "Extraction & Distillation", R, "II", "Vapeur d'eau et matière végétale", "2", 3, 2000, null, "Hors zone", "En service", "Bâtiment A", "Distillation", "Alambic n°1 (lavande, lavandin)", 2013, "Chaudronnerie du Sud-Est", 88, 400),
+    D("RS-EX-014", "Réservoir tampon éthanol 1500 L", "Extraction & Distillation", R, "II", "Éthanol", "1", 3, 1500, null, "Zone 1", "En service", "Bâtiment A", "Absolues", "Stockage journalier d'éthanol", 2016, "De Dietrich Process Systems", 45, 1600),
+    D("RS-EX-015", "Ballon de stockage hexane 600 L", "Extraction & Distillation", R, "II", "Hexane", "1", 2, 600, null, "Zone 1", "Isolé", "Bâtiment A", "Concrètes", "Ligne d'extraction au solvant arrêtée", 2010, "Chaudronnerie du Sud-Est", -200, -200,
+      { notes: "Isolé et vidangé depuis l'arrêt de la ligne hexane. Requalification obligatoire avant toute remise en service." }),
+    // Synthèse aromatique
+    D("RE-SY-020", "Réacteur inox 1000 L double enveloppe", "Synthèse aromatique", "Réacteur", "III", "Acétate d'éthyle, esters aromatiques", "1", 6, 1000, null, "Zone 1", "En service", "Bâtiment B", "Synthèse 1", "Poste R1", 2015, "De Dietrich Process Systems", 25, 1200,
+      { notable: { d: 150, c: "Remplacement de la garniture mécanique de l'agitateur. Contrôle visuel et épreuve d'étanchéité satisfaisants." }, plan: [{ d: 18, type: "Visite périodique" }] }),
+    D("RE-SY-021", "Réacteur émaillé 2500 L", "Synthèse aromatique", "Réacteur", "III", "Toluène et solvants", "1", 4, 2500, null, "Zone 1", "À l'arrêt / Consigné", "Bâtiment B", "Synthèse 2", "Poste R2", 2009, "Pfaudler", -60, -60,
+      { notes: "Consigné pour réparation de l'émail. Requalification périodique dépassée : à réaliser avant la remise en service.", plan: [{ d: 45, type: "Requalification périodique" }] }),
+    D("RE-SY-022", "Réacteur d'hydrogénation 300 L", "Synthèse aromatique", "Réacteur", "IV", "Hydrogène, lactones", "1", 30, 300, null, "Zone 1", "En service", "Bâtiment B", "Hydrogénation", "Cellule H2 (local blindé)", 2020, "Autoclave France", 300, 2300),
+    D("EC-SY-023", "Échangeur à plaques condenseur solvant", "Synthèse aromatique", "Échangeur", "II", "Vapeurs de solvant / eau glycolée", "1", 6, 40, null, "Zone 2", "En service", "Bâtiment B", "Synthèse 1", "Condenseur du poste R1", 2015, "Alfa Laval", 1440, 1300,
+      { ipStatus: "Réalisé" }),
+    D("TU-SY-024", "Distribution vapeur atelier synthèse DN80", "Synthèse aromatique", "Tuyauterie", "II", "Vapeur d'eau", "2", 8, null, 80, "Hors zone", "En service", "Bâtiment B", "Synthèse 1", "Nourrice vapeur B", 2015, "Entreprise de tuyauterie Sud", -8, 1500),
+    D("AS-SY-025", "Soupape de sûreté du réacteur RE-SY-020", "Synthèse aromatique", "Accessoire de sécurité", "IV", "Vapeurs de solvant", "1", 6, null, 50, "Zone 1", "En service", "Bâtiment B", "Synthèse 1", "Piquage supérieur de RE-SY-020", 2015, "Leser", 40, 900),
+    D("RE-SY-009", "Ancien réacteur 800 L (rébuté)", "Synthèse aromatique", "Réacteur", "II", "Solvants", "1", 4, 800, null, "Hors zone", "Hors service / Rébuté", "Bâtiment B", "Synthèse 3", "Emplacement libéré", 2003, "Pfaudler", null, null,
+      { notes: "Mis au rebut en 2023, découpé et évacué. Dossier de démantèlement archivé." }),
+    // Formulation & Mélange
+    D("CU-FO-030", "Cuve de dissolution double enveloppe 3000 L", "Formulation & Mélange", "Réacteur", "II", "Éthanol, concentrés parfumants", "1", 3, 3000, null, "Zone 2", "En service", "Bâtiment C", "Macération", "Cuve M3", 2018, "Inoxydable Provence", 500, 2500),
+    D("EC-FO-031", "Échangeur de refroidissement solutions parfumantes", "Formulation & Mélange", "Échangeur", "II", "Éthanol / eau glycolée", "1", 6, 80, null, "Zone 2", "En service", "Bâtiment C", "Macération", "Boucle froid de macération", 2018, "Alfa Laval", 29, 2000),
+    D("PT-FO-032", "Pot de transport pneumatique de poudres (vanilline)", "Formulation & Mélange", R, "I", "Air comprimé et poudre de vanilline", "2", 4, 250, null, "Zone 21", "En service", "Bâtiment C", "Poudres", "Transfert vers le mélangeur de poudres", 2019, "Inoxydable Provence", 800, 2000),
+    D("EB-FO-033", "Batterie vapeur de l'atomiseur (arômes en poudre)", "Formulation & Mélange", "Échangeur", "II", "Vapeur d'eau", "2", 10, 90, null, "Zone 22", "En service", "Bâtiment C", "Atomisation", "Tour d'atomisation A1", 2017, "GEA", 70, 1800),
+    // Conditionnement
+    D("RA-CO-040", "Réservoir air comprimé ligne flaconnage 1000 L", "Conditionnement", R, "II", "Air comprimé", "2", 8, 1000, null, "Hors zone", "En service", "Bâtiment D", "Flaconnage", "Ligne F2", 2019, "Kaeser", 600, 2600),
+    D("GP-CO-041", "Cuve tampon gaz propulseur GPL 400 L", "Conditionnement", R, "III", "GPL (butane / propane)", "1", 8, 400, null, "Zone 1", "En service", "Bâtiment D", "Aérosols", "Parc propulseur de la ligne A3", 2016, "Chaudronnerie du Sud-Est", 15, 700,
+      { plan: [{ d: 9, type: "Visite périodique" }] }),
+    D("TU-CO-042", "Tuyauterie GPL DN25 ligne aérosols", "Conditionnement", "Tuyauterie", "II", "GPL (butane / propane)", "1", 8, null, 25, "Zone 1", "En service", "Bâtiment D", "Aérosols", "De la cuve GP-CO-041 à la sertisseuse", 2016, "Entreprise de tuyauterie Sud", 210, 2200),
+    // Laboratoire & Pilote
+    D("RE-LP-050", "Réacteur pilote 50 L", "Laboratoire & Pilote", "Réacteur", "I", "Solvants divers", "1", 10, 50, null, "Zone 2", "En service", "Laboratoire R&D", "Halle pilote", "Poste pilote P1", 2021, "Parr Instrument", 400, 2000),
+    D("AC-LP-051", "Autoclave pilote CO2 5 L", "Laboratoire & Pilote", "Réacteur", "III", "CO2 supercritique", "2", 400, 5, null, "Hors zone", "En service", "Laboratoire R&D", "Halle pilote", "Poste pilote P2", 2022, "Separex", null, null,
+      { commAgoM: 40, notes: "Aucun contrôle enregistré : les échéances sont calculées depuis la date de mise en service." })
+  ];
+}
+const DEMO_USERS = [
+  { username: 'inspecteur', displayName: 'Camille Roux (responsable réglementaire)', perms: ['view_esp', 'edit_esp', 'enter_control', 'validate_control', 'view_audit'], poles: [] },
+  { username: 'op.synthese', displayName: "Karim Benali (chef d'atelier Synthèse)", perms: ['view_esp', 'edit_esp', 'enter_control'], poles: ['Synthèse aromatique'] },
+  { username: 'lecture.utilites', displayName: 'Julie Martin (technicienne Utilités)', perms: ['view_esp'], poles: ['Utilités'] }
+];
+
+async function loadDemo() {
+  if (state.user.role !== 'admin') return toast("Réservé à l'administrateur.", 'err');
+  if (!confirm("Ajouter les données de démonstration (28 ESP, leurs contrôles et 3 comptes de test) aux données existantes ?")) return;
+  toast('Chargement en cours…', 'info');
+  const specs = demoSpecs(), ops = [], me = state.user.username;
+  const meta = { createdAt: FV.serverTimestamp(), createdBy: me, updatedAt: FV.serverTimestamp(), updatedBy: me };
+  const plus = n => { const d = new Date(); d.setDate(d.getDate() + n); return toISO(d); };
+  let nCtrl = 0;
+  specs.forEach((s, i) => {
+    const id = 'demo_' + s.tag, [ipM, rpM] = DEFAULT_PERIODS[s.type];
+    const comm = s.commAgoM ? addMonths(todayISO(), -s.commAgoM) : `${s.year}-05-15`;
+    ops.push({ ref: db.collection('esp').doc(id), data: { tag: s.tag, name: s.name, pole: s.pole, serial: `SN-${String(s.year).slice(2)}-${4100 + i * 53}`, manufacturer: s.manufacturer, year: s.year,
+      category: s.category, type: s.type, fluid: s.fluid, fluidGroup: s.fluidGroup, ps: s.ps, volume: s.volume, dn: s.dn, atex: s.atex, status: s.status,
+      building: s.building, workshop: s.workshop, location: s.location, commissioningDate: comm, ipMonths: ipM, rpMonths: rpM, notes: s.notes || '', ...meta } });
+    ops.push({ ref: db.collection('audit').doc(), data: auditEntry({ action: 'Création', entity: 'ESP', entityId: id, label: s.tag, espId: id, changes: [{ field: 'Origine', old: '', new: 'Données de démonstration' }] }) });
+    const doc = (label, date) => ({ name: `${label} ${s.tag} ${date.slice(0, 4)}.pdf`, url: `https://ged.exemple.fr/esp/${s.tag}/${label.toLowerCase().replace(/\W+/g, '-')}-${date.slice(0, 4)}.pdf`, kind: 'link' });
+    let n = 0;
+    const ctrl = (type, status, planned, done, result, comment, docs) => {
+      n++; nCtrl++;
+      ops.push({ ref: db.collection('controls').doc(`${id}_${n}`), data: { espId: id, type, status, plannedDate: planned || '', doneDate: done || '', inspector: DEMO_ORGS[(i + n) % 3],
+        result: result || '', comment: comment || '', attachments: docs || [], validatedBy: status === 'Clôturé' ? me : '', validatedAt: status === 'Clôturé' ? done : '', ...meta } });
+    };
+    if (s.ipIn != null) {
+      const last = addMonths(plus(s.ipIn), -ipM);
+      if (last > comm) {
+        const prev = addMonths(last, -ipM);
+        if (prev > comm) ctrl('Visite périodique', 'Clôturé', prev, prev, 'Conforme', 'Aucune anomalie constatée.', [doc('Rapport de visite', prev)]);
+        const res = i % 7 === 3 ? 'Conforme avec réserves' : 'Conforme';
+        ctrl('Visite périodique', s.ipStatus || 'Clôturé', last, last, res, res === 'Conforme' ? 'Aucune anomalie constatée.' : 'Réserve mineure : calorifuge à reprendre, levée sous 3 mois.', [doc('Rapport de visite', last)]);
+      }
+    }
+    if (s.rpIn != null) {
+      const last = addMonths(plus(s.rpIn), -rpM);
+      if (last > comm) ctrl('Requalification périodique', 'Clôturé', last, last, 'Conforme', 'Inspection, épreuve et contrôle des accessoires de sécurité satisfaisants.', [doc('PV requalification', last), doc('Attestation épreuve', last)]);
+    }
+    if (s.nc) { const d = plus(-s.nc.d); ctrl('Visite périodique', 'Clôturé', d, d, 'Non conforme', s.nc.c, [doc('Rapport de visite', d)]); }
+    if (s.notable) { const d = plus(-s.notable.d); ctrl('Contrôle après intervention notable', 'Clôturé', d, d, 'Conforme', s.notable.c, [doc('Rapport intervention', d)]); }
+    (s.plan || []).forEach(p => ctrl(p.type, 'Planifié', plus(p.d), '', '', "Contrôle planifié avec l'organisme habilité.", []));
+  });
+  for (const u of DEMO_USERS) {
+    const salt = newSalt(), permissions = {}; PERMS.forEach(p => { permissions[p.key] = u.perms.includes(p.key); });
+    ops.push({ ref: db.collection('users').doc(u.username), data: { username: u.username, displayName: u.displayName, role: 'user', active: true, permissions, poles: u.poles, salt, hash: await hashPw(DEMO_PW, salt), createdAt: FV.serverTimestamp() } });
+  }
+  ops.push({ ref: db.collection('audit').doc(), data: auditEntry({ action: 'Création', entity: 'Application', entityId: 'demo', label: 'Chargement des données de démonstration',
+    changes: [{ field: 'ESP', old: '', new: String(specs.length) }, { field: 'Contrôles', old: '', new: String(nCtrl) }, { field: 'Comptes de test', old: '', new: String(DEMO_USERS.length) }] }) });
+  for (let k = 0; k < ops.length; k += 400) {
+    const b = db.batch(); ops.slice(k, k + 400).forEach(o => b.set(o.ref, o.data)); await b.commit();
+  }
+  openModal(`<div class="flex items-center justify-between p-4 border-b"><h2 class="text-lg font-semibold">Données de démonstration chargées</h2><button class="btn btn-ghost" data-act="close">Fermer</button></div>
+  <div class="p-4 text-sm space-y-3">
+    <p>${specs.length} équipements, ${nCtrl} contrôles et ${DEMO_USERS.length} comptes de test ont été créés. Les liens de pièces jointes sont fictifs.</p>
+    <div class="overflow-x-auto border rounded-md"><table class="w-full"><thead><tr><th>Identifiant</th><th>Profil</th><th>Pôles visibles</th></tr></thead><tbody>
+    ${DEMO_USERS.map(u => `<tr><td class="font-medium">${esc(u.username)}</td><td>${esc(u.displayName)}<div class="text-xs text-slate-500">${esc(u.perms.map(k => PERMS.find(p => p.key === k).label).join(', '))}</div></td><td>${u.poles.length ? esc(u.poles.join(', ')) : 'Tous'}</td></tr>`).join('')}
+    </tbody></table></div>
+    <p class="text-slate-600">Mot de passe des trois comptes : <b>${DEMO_PW}</b>. Connectez-vous avec l'un d'eux dans une fenêtre de navigation privée pour voir l'effet des droits et des pôles. Le bouton « Réinitialiser toutes les données » supprime le tout.</p></div>`);
+}
+
+async function wipe(col, keep) {
+  const docs = (await db.collection(col).get()).docs.filter(d => !(keep && keep(d)));
+  for (let k = 0; k < docs.length; k += 400) { const b = db.batch(); docs.slice(k, k + 400).forEach(d => b.delete(d.ref)); await b.commit(); }
+  return docs.length;
+}
+async function resetAll() {
+  let n = 0;
+  n += await wipe('controls'); n += await wipe('esp'); n += await wipe('audit');
+  n += await wipe('users', d => d.data().role === 'admin');          // le compte administrateur est conservé
+  await db.collection('audit').add(auditEntry({ action: 'Suppression', entity: 'Application', entityId: 'reset', label: 'Réinitialisation complète des données',
+    changes: [{ field: 'Documents supprimés', old: String(n), new: '' }] }));
+  return n;
+}
+function openReset() {
+  openModal(`<div class="flex items-center justify-between p-4 border-b"><h2 class="text-lg font-semibold">Réinitialiser toutes les données</h2><button class="btn btn-ghost" data-act="close">Fermer</button></div>
+  <form data-form="reset" class="p-4 space-y-3 max-w-md">
+    <div class="rounded-md bg-red-50 text-red-800 text-sm p-3" role="alert">Supprime définitivement tous les ESP, tous les contrôles, le journal d'audit et tous les comptes utilisateurs, sauf le compte administrateur. Cette action est irréversible.</div>
+    <label class="block text-sm font-medium">Mot de passe administrateur<input class="fld" type="password" name="password" required autocomplete="current-password"></label>
+    <button class="btn btn-danger" type="submit">Effacer toutes les données</button></form>`);
 }
 
 /* =====================================================================
@@ -736,6 +928,8 @@ document.addEventListener('click', async ev => {
         if (!name || !isHttp(url)) return toast('Renseignez un nom et une URL commençant par http(s)://', 'err');
         ctrlAtt.push({ name, url, kind: 'link' }); $('#att-list').innerHTML = attList(false); $('#att-name').value = $('#att-url').value = ''; break; }
       case 'att-del': ctrlAtt.splice(+el.dataset.i, 1); $('#att-list').innerHTML = attList(false); break;
+      case 'demo-load': await loadDemo(); break;
+      case 'reset-open': if (state.user.role === 'admin') openReset(); break;
       case 'user-new': openUser(null); break;
       case 'user-open': openUser(id); break;
       case 'user-delete': {
@@ -751,7 +945,7 @@ document.addEventListener('input', ev => {
   const p = ev.target.dataset?.filter; if (!p) return;
   const [a, b] = p.split('.'); if (b) state[a][b] = ev.target.value; else state[a] = ev.target.value;
   const t = { fEsp: ['#esp-table', espTable], fCtrl: ['#ctrl-table', ctrlTable], fAudit: ['#audit-table', auditBody] }[a];
-  $(t[0]).innerHTML = t[1]();
+  if (t) $(t[0]).innerHTML = t[1](); else renderView();
 });
 
 document.addEventListener('submit', async ev => {
@@ -769,7 +963,9 @@ document.addEventListener('submit', async ev => {
       const id = form.dataset.id || db.collection('esp').doc().id, before = form.dataset.id ? espById(id) : null;
       const tag = g('tag');
       if (state.esp.some(e => e.id !== id && (e.tag || '').toLowerCase() === tag.toLowerCase())) throw new Error(`Le tag « ${tag} » existe déjà.`);
-      const data = { tag, serial: g('serial'), manufacturer: g('manufacturer'), year: num(g('year')), category: g('category'), type: g('type'),
+      const rp = userPoles();
+      if (rp.length && !rp.includes(g('pole'))) throw new Error("Ce pôle ne fait pas partie de vos pôles autorisés.");
+      const data = { tag, name: g('name'), pole: g('pole'), serial: g('serial'), manufacturer: g('manufacturer'), year: num(g('year')), category: g('category'), type: g('type'),
         fluid: g('fluid'), fluidGroup: g('fluidGroup'), ps: num(g('ps')), volume: num(g('volume')), dn: num(g('dn')), atex: g('atex'), status: g('status'),
         building: g('building'), workshop: g('workshop'), location: g('location'), commissioningDate: g('commissioningDate'),
         ipMonths: num(g('ipMonths')), rpMonths: num(g('rpMonths')), notes: g('notes') };
@@ -804,16 +1000,24 @@ document.addEventListener('submit', async ev => {
       if (!editing && state.users.some(u => u.id === username)) throw new Error('Cet identifiant existe déjà.');
       const isAdmin = before?.role === 'admin';
       const permissions = {}; PERMS.forEach(p => { permissions[p.key] = isAdmin ? true : !!fd.get('perm_' + p.key); });
-      const data = { username, displayName: g('displayName'), role: before?.role || 'user', active: isAdmin ? true : !!fd.get('active'), permissions: isAdmin ? (before.permissions || {}) : permissions };
+      const data = { username, displayName: g('displayName'), role: before?.role || 'user', active: isAdmin ? true : !!fd.get('active'), permissions: isAdmin ? (before.permissions || {}) : permissions, poles: isAdmin ? [] : fd.getAll('poles') };
       const pw = fd.get('password');
       if (pw) { data.salt = newSalt(); data.hash = await hashPw(pw, data.salt); }
-      const auditData = { displayName: data.displayName, active: data.active, permissions: data.permissions, ...(pw ? { password: '(modifié)' } : {}) };
+      const auditData = { displayName: data.displayName, active: data.active, permissions: data.permissions, poles: data.poles, ...(pw ? { password: '(modifié)' } : {}) };
       const changes = diff(before, auditData);
       if (before && !changes.length) { closeModal(); return toast('Aucune modification', 'info'); }
       const batch = db.batch();
       batch.set(db.collection('users').doc(username), { ...data, ...(before ? {} : { createdAt: FV.serverTimestamp() }) }, { merge: true });
       batch.set(db.collection('audit').doc(), auditEntry({ action: before ? 'Modification' : 'Création', entity: 'Utilisateur', entityId: username, label: username, changes }));
       await batch.commit(); closeModal(); toast('Utilisateur enregistré');
+    }
+    if (kind === 'reset') {
+      if (state.user.role !== 'admin') throw new Error("Réservé à l'administrateur.");
+      const u = (await db.collection('users').doc(state.user.username).get()).data();
+      if (await hashPw(fd.get('password'), u.salt) !== u.hash) throw new Error('Mot de passe administrateur incorrect.');
+      if (!confirm('Dernière confirmation : effacer toutes les données de l\'application ?')) return;
+      const n = await resetAll();
+      closeModal(); toast(`Données réinitialisées (${n} documents supprimés).`);
     }
     if (kind === 'pwd') {
       const u = (await db.collection('users').doc(state.user.username).get()).data();
