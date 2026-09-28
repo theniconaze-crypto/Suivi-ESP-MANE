@@ -171,7 +171,7 @@ function initFirebase() {
   if (ENABLE_FILE_UPLOAD) storage = firebase.storage();
 }
 const can = p => !!state.user && (state.user.role === 'admin' || !!state.user.permissions?.[p]);
-const canCarl = () => canCarl() || can('edit_carl');   // clic vers CARL : le droit de modification inclut la consultation
+const canCarl = () => can('open_carl') || can('edit_carl');   // clic vers CARL : le droit de modification inclut la consultation
 const espById = id => state.esp.find(e => e.id === id);
 /* Visibilité par service / pôle : liste vide = tous les pôles ; l'admin voit tout */
 const userPoles = () => (!state.user || state.user.role === 'admin') ? [] : (state.user.poles || []);
