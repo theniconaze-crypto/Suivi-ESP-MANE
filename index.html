@@ -153,8 +153,8 @@ async function hashPw(pw, salt) {
 /* =====================================================================
    4. ÉTAT GLOBAL & FIREBASE
    ===================================================================== */
-const state = { user: null, esp: [], controls: [], audit: [], users: [], route: 'dashboard',
-  fDash: { pole: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' };
+const state = { user: null, esp: [], controls: [], audit: [], users: [], config: {}, configError: '', route: 'dashboard',
+  fDash: { pole: '', due: '', plan: '', next: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' };
 let db, auth, storage, FV; const unsubs = []; let charts = [];
 const app = $('#app');
 
@@ -169,7 +169,37 @@ const espById = id => state.esp.find(e => e.id === id);
 const userPoles = () => (!state.user || state.user.role === 'admin') ? [] : (state.user.poles || []);
 const visibleEsp = () => { const p = userPoles(); return p.length ? state.esp.filter(e => p.includes(e.pole)) : state.esp; };
 const visibleIds = () => new Set(visibleEsp().map(e => e.id));
-const allPoles = () => [...new Set([...POLES_DEFAULT, ...state.esp.map(e => e.pole).filter(Boolean)])].sort((a, b) => a.localeCompare(b, 'fr'));
+/* Référentiels (listes de valeurs des colonnes ESP), gérés par l'administrateur et stockés dans Firestore : config/lists.
+   Valeurs affichées = liste enregistrée (ou valeurs par défaut) + valeurs déjà utilisées par des ESP + valeurs « système » verrouillées.
+   Une valeur utilisée par un ESP ne peut pas être supprimée : aucune donnée existante ne perd donc son libellé. */
+const LIST_DEFS = {
+  poles:      { label: 'Services / Pôles',           field: 'pole',     defaults: POLES_DEFAULT, sort: true, hint: 'Colonne « Pôle » — et pôles attribuables aux utilisateurs.' },
+  types:      { label: "Types d'équipement",         field: 'type',     defaults: ESP_TYPES,     hint: 'Colonne « Type ».' },
+  categories: { label: 'Catégories DESP / PED',      field: 'category', defaults: CATEGORIES,    hint: 'Colonne « Cat. ».' },
+  fluids:     { label: 'Fluides',                    field: 'fluid',    defaults: ['Air comprimé', 'Azote', "Vapeur d'eau", 'Eau', 'Éthanol', 'CO2'], sort: true, hint: 'Colonne « Fluide » (types de gaz et de liquides).' },
+  atex:       { label: 'Zones ATEX',                 field: 'atex',     defaults: ATEX_ZONES,    locked: ['Hors zone'], hint: 'Colonne « Zone ATEX ». « Hors zone » est une valeur système.' },
+  statuses:   { label: "Statuts de l'installation",  field: 'status',   defaults: STATUSES,      locked: ['En service', OUT_STATUS], hint: `Colonne « Statut ». « En service » et « ${OUT_STATUS} » pilotent le suivi : non supprimables.` },
+  buildings:  { label: 'Bâtiments',                  field: 'building', defaults: [],            sort: true, hint: 'Colonne « Localisation » (bâtiment).' },
+  workshops:  { label: 'Ateliers',                   field: 'workshop', defaults: [],            sort: true, hint: 'Colonne « Localisation » (atelier).' }
+};
+const usedValues = key => [...new Set(state.esp.map(e => e[LIST_DEFS[key].field]).filter(Boolean))];
+function listOf(key) {
+  const d = LIST_DEFS[key], stored = Array.isArray(state.config?.[key]) ? state.config[key] : d.defaults;
+  const out = [...new Set([...stored, ...(d.locked || []), ...usedValues(key)])];      // valeurs système ajoutées seulement si absentes : l'ordre de la liste est conservé
+  return d.sort ? out.sort((a, b) => a.localeCompare(b, 'fr')) : out;
+}
+const allPoles = () => listOf('poles');
+const withCur = (arr, cur) => (!cur || arr.includes(cur)) ? arr : [...arr, cur];       // conserve la valeur actuelle d'un ESP même si elle n'est plus listée
+const emptyHint = key => listOf(key).length ? undefined : '— (liste vide : à créer par un administrateur)';
+const usageCount = (key, v) => state.esp.filter(e => e[LIST_DEFS[key].field] === v).length + (key === 'poles' ? state.users.filter(u => (u.poles || []).includes(v)).length : 0);
+async function saveList(key, next, change) {
+  const d = LIST_DEFS[key]; if (state.user.role !== 'admin') throw new Error("Réservé à l'administrateur.");
+  if (d.sort) next = [...next].sort((a, b) => a.localeCompare(b, 'fr'));
+  const batch = db.batch();
+  batch.set(db.collection('config').doc('lists'), { [key]: next, updatedAt: FV.serverTimestamp(), updatedBy: state.user.username }, { merge: true });
+  batch.set(db.collection('audit').doc(), auditEntry({ action: 'Modification', entity: 'Référentiel', entityId: key, label: d.label, changes: [change] }));
+  await batch.commit();
+}
 
 /* =====================================================================
    5. CALCUL DES ÉCHÉANCES RÉGLEMENTAIRES
@@ -202,7 +232,10 @@ function planOf(e, d) {
   const match = (c, t) => c.type === t || (t === 'Visite périodique' && c.type === 'Requalification périodique');
   const gap = [['Requalification périodique', d.rpDue], ['Visite périodique', d.ipDue]]
     .filter(([t, due]) => due && daysUntil(due) <= PLAN_HORIZON_DAYS && !future.some(c => match(c, t)))
-    .map(([type, due]) => ({ type, due, days: daysUntil(due), stale: open.some(c => match(c, type)) }))
+    .map(([type, due]) => {
+      const st = open.filter(c => match(c, type)).sort((a, b) => (b.plannedDate || '').localeCompare(a.plannedDate || ''))[0];
+      return { espId: e.id, type, due, days: daysUntil(due), stale: !!st, staleId: st?.id || '' };
+    })
     .sort((a, b) => a.due.localeCompare(b.due))[0] || null;
   return { gap, planned: future.map(c => c.plannedDate).sort()[0] || null };
 }
@@ -224,9 +257,25 @@ function dueBadge(d) {
 /* Indicateur « échéance sans planification » (liste + tableau de bord) */
 function planBadge(d) {
   if (!d.monitored) return '<span class="text-slate-500">—</span>';
-  if (d.gap) return `${badge(d.gap.stale ? 'Planification dépassée' : 'À planifier', 'violet')}<div class="text-xs text-slate-500 mt-0.5">${esc(d.gap.type)} · ${fmtDate(d.gap.due)}</div>`;
+  if (d.gap) {
+    const g = d.gap, label = g.stale ? 'Planification dépassée' : 'À planifier';
+    const sub = `<div class="text-xs text-slate-500 mt-0.5">${esc(g.type)} · ${fmtDate(g.due)}</div>`;
+    if (!can('enter_control')) return badge(label, 'violet') + sub;
+    // À planifier → nouvelle planification pré-remplie ; planification dépassée → ouverture du contrôle existant (replanifier ou clôturer)
+    const attrs = g.stale && g.staleId ? `data-act="ctrl-open" data-id="${esc(g.staleId)}"` : `data-act="plan-new" data-esp="${esc(g.espId)}" data-type="${esc(g.type)}" data-due="${esc(g.due)}"`;
+    const title = g.stale ? 'Ouvrir le contrôle planifié pour le replanifier ou le clôturer' : 'Planifier ce contrôle';
+    return `<button type="button" ${attrs} title="${title}" class="inline-block whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${BADGE.violet} hover:bg-violet-200 cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-violet-600">${label} ›</button>${sub}`;
+  }
   return d.planned ? `<span class="text-xs text-slate-600">Planifié le ${fmtDate(d.planned)}</span>` : '<span class="text-slate-500">—</span>';
 }
+const DUE_OPTS = ['Échu', '≤ 30 jours', '≤ 90 jours', 'Conforme'];
+const PLAN_OPTS = [PLAN_FILTER, 'Planifié'];      // « Planifié » = un contrôle « Planifié » à venir existe et aucune échéance proche n'est découverte
+function dueMatch(f, d) {
+  if (!f) return true;
+  if (!d.monitored || d.days === null) return false;
+  return f === 'Échu' ? d.days < 0 : f === '≤ 30 jours' ? d.days >= 0 && d.days <= 30 : f === '≤ 90 jours' ? d.days >= 0 && d.days <= 90 : f === 'Conforme' ? d.days > 90 : true;
+}
+const planMatch = (f, d) => !f || (f === PLAN_FILTER ? !!d.gap : (d.monitored && !d.gap && !!d.planned));
 const gapCell = d => d.gap ? 'border-l-4 border-l-violet-500' : '';   // repère visuel en début de ligne
 const dueClass = d => !d.monitored || d.days === null ? 'gray' : d.days < 0 ? 'red' : d.days <= 30 ? 'orange' : d.days <= 90 ? 'yellow' : 'green';
 
@@ -298,7 +347,7 @@ function startSession(u) {
 function logout() {
   unsubs.splice(0).forEach(f => f()); sessionStorage.removeItem('esp_user');
   Object.assign(state, { user: null, esp: [], controls: [], audit: [], users: [],
-    fDash: { pole: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' });
+    config: {}, configError: '', fDash: { pole: '', due: '', plan: '', next: '' }, fEsp: { q: '', status: '', atex: '', due: '', pole: '', plan: '' }, fCtrl: { q: '', type: '', status: '' }, fAudit: '' });
   closeModal(); renderLogin();
 }
 /* Signature canonique des droits : Firestore ne garantit pas l'ordre des clés d'une map (cache local vs serveur),
@@ -315,6 +364,8 @@ function startListeners() {
     state.user = s.data();
     if (prev !== userSig(state.user)) setTimeout(() => { startListeners(); renderShell(); }, 0);
   }, err));
+  unsubs.push(db.collection('config').doc('lists').onSnapshot(s => { state.config = s.exists ? s.data() : {}; state.configError = ''; renderView(); },
+    e => { console.warn('Référentiels indisponibles :', e.message); state.configError = e.message; state.config = {}; if (state.route === 'lists') renderView(); }));
   unsubs.push(db.collection('esp').onSnapshot(s => { state.esp = list(s); renderView(); }, err));
   unsubs.push(db.collection('controls').onSnapshot(s => { state.controls = list(s); renderView(); }, err));
   if (can('view_audit'))
@@ -362,7 +413,8 @@ const ROUTES = {
   esp:       { label: 'Équipements',     perm: 'view_esp', view: viewEsp },
   controls:  { label: 'Contrôles',       perm: 'view_esp', view: viewControls },
   audit:     { label: "Journal d'audit", perm: 'view_audit', view: viewAudit },
-  users:     { label: 'Utilisateurs',    perm: 'manage_users', view: viewUsers }
+  users:     { label: 'Utilisateurs',    perm: 'manage_users', view: viewUsers },
+  lists:     { label: 'Référentiels',    perm: 'manage_lists', view: viewLists }   // administrateur uniquement (aucune permission « manage_lists » n'est attribuable)
 };
 function allowedRoutes() { return Object.keys(ROUTES).filter(k => can(ROUTES[k].perm)); }
 
@@ -408,7 +460,6 @@ function viewDashboard() {
   const within = n => mon.filter(x => x.d.days !== null && x.d.days >= 0 && x.d.days <= n).length;
   const overdue = mon.filter(x => x.d.days !== null && x.d.days < 0).length;
   const card = (label, val, c, hint) => `<div class="bg-white rounded-lg shadow-sm border-l-4 ${c} p-4"><div class="text-3xl font-semibold">${val}</div><div class="text-sm font-medium mt-1">${label}</div><div class="text-xs text-slate-500">${hint}</div></div>`;
-  const top = mon.filter(x => x.d.next).sort((a, b) => a.d.next.localeCompare(b.d.next)).slice(0, 10);
   const poleOpts = userPoles().length ? userPoles() : allPoles();
   const gaps = mon.filter(x => x.d.gap), gapLate = gaps.filter(x => x.d.gap.days < 0).length;
   const planBanner = !mon.length ? '' : gaps.length
@@ -437,12 +488,33 @@ function viewDashboard() {
     ${['Répartition par type', 'Répartition par zone ATEX', 'Répartition par statut', 'Répartition par service / pôle'].map((t, i) => `
       <div class="bg-white rounded-lg shadow-sm p-4"><h2 class="text-sm font-semibold mb-2">${t}</h2><div class="relative h-56"><canvas id="ch${i}"></canvas></div></div>`).join('')}
   </div>
-  <div class="bg-white rounded-lg shadow-sm mt-5 overflow-x-auto">
-    <h2 class="text-sm font-semibold p-4 pb-2">Échéances prioritaires</h2>
-    <table class="w-full min-w-[820px]"><thead><tr><th>Tag</th><th>Pôle</th><th>Prochain contrôle</th><th>Échéance</th><th>État</th><th>Planification</th></tr></thead><tbody>
-    ${top.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}"><td class="font-medium ${gapCell(d)}">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.name || e.type)}</div></td><td>${esc(e.pole) || '—'}</td><td>${esc(d.nextType)}</td><td>${fmtDate(d.next)}</td><td>${dueBadge(d)}</td><td>${planBadge(d)}</td></tr>`).join('')
-      || `<tr><td colspan="6" class="text-slate-500">Aucun équipement suivi. ${state.user.role === 'admin' ? '<button class="underline text-sky-700" data-act="demo-load">Charger les données de démonstration</button>' : "Ajoutez un ESP depuis l'onglet Équipements."}</td></tr>`}
-    </tbody></table></div>`;
+  <div class="bg-white rounded-lg shadow-sm mt-5">
+    <div class="p-4 pb-2 flex flex-wrap items-end justify-between gap-3">
+      <h2 class="text-sm font-semibold">Échéances prioritaires</h2>
+      <div class="flex flex-wrap items-end gap-2">
+        <label class="text-xs font-medium">État<select class="fld !mt-1 min-w-[10rem]" data-filter="fDash.due">${opt(DUE_OPTS, state.fDash.due, 'Tous les états')}</select></label>
+        <label class="text-xs font-medium">Planification<select class="fld !mt-1 min-w-[12rem]" data-filter="fDash.plan">${opt(PLAN_OPTS, state.fDash.plan, 'Toutes les planifications')}</select></label>
+        <label class="text-xs font-medium">Prochain contrôle<select class="fld !mt-1 min-w-[12rem]" data-filter="fDash.next">${opt(['Visite périodique', 'Requalification périodique'], state.fDash.next, 'Tous les contrôles')}</select></label>
+        <button type="button" class="btn btn-ghost" data-act="dash-reset">Réinitialiser</button>
+      </div>
+    </div>
+    <div id="dash-table" class="overflow-x-auto">${dashTable()}</div>
+  </div>`;
+}
+/* Tableau « Échéances prioritaires » : 10 lignes sans filtre ; avec filtre, toutes les correspondances (100 max) */
+function dashRows() {
+  const f = state.fDash;
+  return dashEsp().map(e => ({ e, d: dueOf(e) }))
+    .filter(({ d }) => d.monitored && d.next && dueMatch(f.due, d) && planMatch(f.plan, d) && (!f.next || d.nextType === f.next))
+    .sort((a, b) => a.d.next.localeCompare(b.d.next));
+}
+function dashTable() {
+  const f = state.fDash, filtered = !!(f.due || f.plan || f.next), all = dashRows(), rows = all.slice(0, filtered ? 100 : 10);
+  return `<table class="w-full min-w-[820px]"><thead><tr><th>Tag</th><th>Pôle</th><th>Prochain contrôle</th><th>Échéance</th><th>État</th><th>Planification</th></tr></thead><tbody>
+    ${rows.map(({ e, d }) => `<tr data-act="esp-open" data-id="${e.id}"><td class="font-medium ${gapCell(d)}">${esc(e.tag)}<div class="text-xs text-slate-500 font-normal">${esc(e.name || e.type)}</div></td><td>${esc(e.pole) || '—'}</td><td>${esc(d.nextType)}</td><td>${fmtDate(d.next)}</td><td>${dueBadge(d)}</td><td>${planBadge(d)}</td></tr>`).join('')
+      || (filtered ? `<tr><td colspan="6" class="text-slate-500">Aucun équipement ne correspond à ces filtres.</td></tr>`
+        : `<tr><td colspan="6" class="text-slate-500">Aucun équipement suivi. ${state.user.role === 'admin' ? '<button class="underline text-sky-700" data-act="demo-load">Charger les données de démonstration</button>' : "Ajoutez un ESP depuis l'onglet Équipements."}</td></tr>`)}
+    </tbody></table><div class="px-3 py-2 text-xs text-slate-500 border-t">${filtered ? `${all.length} équipement(s) correspondent${all.length > 100 ? ' — 100 premiers affichés' : ''}` : 'Les 10 échéances les plus proches (utilisez les filtres pour affiner)'}</div>`;
 }
 function drawCharts() {
   if (!window.Chart) return;
@@ -458,8 +530,8 @@ function drawCharts() {
       options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: type === 'doughnut', position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } } },
         scales: type === 'bar' ? { y: { beginAtZero: true, ticks: { precision: 0 } } } : {} } })); };
   mk('ch0', 'doughnut', count(e => e.type));
-  mk('ch1', 'bar', count(e => e.atex, ATEX_ZONES));
-  mk('ch2', 'doughnut', count(e => e.status, STATUSES));
+  mk('ch1', 'bar', count(e => e.atex, listOf('atex')));
+  mk('ch2', 'doughnut', count(e => e.status, listOf('statuses')));
   mk('ch3', 'doughnut', count(e => e.pole));
 }
 
@@ -480,10 +552,10 @@ function viewEsp() {
   <div class="bg-white rounded-lg shadow-sm p-3 grid sm:grid-cols-2 lg:grid-cols-6 gap-3">
     <input class="fld !mt-0" placeholder="Rechercher (tag, désignation, fluide, lieu…)" value="${esc(f.q)}" data-filter="fEsp.q">
     <select class="fld !mt-0" data-filter="fEsp.pole">${opt(rp.length ? rp : allPoles(), f.pole, 'Tous les pôles')}</select>
-    <select class="fld !mt-0" data-filter="fEsp.status">${opt(STATUSES, f.status, 'Tous les statuts')}</select>
-    <select class="fld !mt-0" data-filter="fEsp.atex">${opt(ATEX_ZONES, f.atex, 'Toutes les zones ATEX')}</select>
-    <select class="fld !mt-0" data-filter="fEsp.due">${opt(['Échu', '≤ 30 jours', '≤ 90 jours', 'Conforme'], f.due, 'Toutes les échéances')}</select>
-    <select class="fld !mt-0" data-filter="fEsp.plan">${opt([PLAN_FILTER], f.plan, 'Toutes les planifications')}</select>
+    <select class="fld !mt-0" data-filter="fEsp.status">${opt(listOf('statuses'), f.status, 'Tous les statuts')}</select>
+    <select class="fld !mt-0" data-filter="fEsp.atex">${opt(listOf('atex'), f.atex, 'Toutes les zones ATEX')}</select>
+    <select class="fld !mt-0" data-filter="fEsp.due">${opt(DUE_OPTS, f.due, 'Toutes les échéances')}</select>
+    <select class="fld !mt-0" data-filter="fEsp.plan">${opt(PLAN_OPTS, f.plan, 'Toutes les planifications')}</select>
   </div>
   <div id="esp-table" class="bg-white rounded-lg shadow-sm mt-3 overflow-x-auto">${espTable()}</div>`;
 }
@@ -493,15 +565,9 @@ function filteredEsp() {
     if (q && !`${e.tag} ${e.name} ${e.serial} ${e.fluid} ${e.manufacturer} ${e.pole} ${e.building} ${e.workshop} ${e.location}`.toLowerCase().includes(q)) return false;
     if (f.pole && e.pole !== f.pole) return false;
     if (f.status && e.status !== f.status) return false;
-    if (f.plan === PLAN_FILTER && !d.gap) return false;
+    if (!planMatch(f.plan, d)) return false;
     if (f.atex && e.atex !== f.atex) return false;
-    if (f.due) {
-      if (!d.monitored || d.days === null) return false;
-      if (f.due === 'Échu' && !(d.days < 0)) return false;
-      if (f.due === '≤ 30 jours' && !(d.days >= 0 && d.days <= 30)) return false;
-      if (f.due === '≤ 90 jours' && !(d.days >= 0 && d.days <= 90)) return false;
-      if (f.due === 'Conforme' && !(d.days > 90)) return false;
-    }
+    if (!dueMatch(f.due, d)) return false;
     return true;
   }).sort((a, b) => (a.d.next || '9999').localeCompare(b.d.next || '9999'));
 }
@@ -532,15 +598,12 @@ function exportCsv() {
 const inp = (name, label, val = '', o = {}) => `<label class="block text-sm font-medium ${o.span || ''}">${label}${o.req ? ' *' : ''}
   <input class="fld" name="${name}" type="${o.type || 'text'}" value="${esc(val)}" ${o.req ? 'required' : ''} ${o.attr || ''}></label>`;
 const sel = (name, label, arr, val, o = {}) => `<label class="block text-sm font-medium ${o.span || ''}">${label}${o.req ? ' *' : ''}
-  <select class="fld" name="${name}" ${o.req ? 'required' : ''}>${opt(arr, val, o.blank === false ? null : '—')}</select></label>`;
+  <select class="fld" name="${name}" ${o.req ? 'required' : ''}>${opt(arr, val, o.blank === false ? null : (o.blank || '—'))}</select></label>`;
 
 /* Champ Service / Pôle : liste fermée pour un utilisateur restreint, saisie assistée sinon */
 function poleField(e) {
   const r = userPoles();
-  if (r.length) return sel('pole', 'Service / Pôle', r, e.pole, { req: 1, blank: false });
-  return `<label class="block text-sm font-medium">Service / Pôle *
-    <input class="fld" name="pole" list="poles-list" value="${esc(e.pole)}" required autocomplete="off">
-    <datalist id="poles-list">${allPoles().map(p => `<option value="${esc(p)}">`).join('')}</datalist></label>`;
+  return sel('pole', 'Service / Pôle', withCur(r.length ? r : listOf('poles'), e.pole), e.pole, { req: 1, blank: r.length ? false : undefined });
 }
 function openEsp(id) {
   const e = id ? visibleEsp().find(x => x.id === id) : { status: 'En service', atex: 'Hors zone', ipMonths: 48, rpMonths: 120 };
@@ -560,17 +623,17 @@ function openEsp(id) {
       ${inp('serial', 'N° de série', e.serial)}
       ${inp('manufacturer', 'Fabricant', e.manufacturer)}
       ${inp('year', 'Année de construction', e.year, { type: 'number', attr: 'min="1900" max="2100"' })}
-      ${sel('category', 'Catégorie DESP / PED', CATEGORIES, e.category)}
-      ${sel('type', "Type d'équipement", ESP_TYPES, e.type, { req: 1 })}
-      ${inp('fluid', 'Fluide contenu', e.fluid)}
+      ${sel('category', 'Catégorie DESP / PED', withCur(listOf('categories'), e.category), e.category)}
+      ${sel('type', "Type d'équipement", withCur(listOf('types'), e.type), e.type, { req: 1 })}
+      ${sel('fluid', 'Fluide contenu', withCur(listOf('fluids'), e.fluid), e.fluid, { blank: emptyHint('fluids') })}
       ${sel('fluidGroup', 'Groupe de fluide', ['1', '2'], e.fluidGroup)}
       ${inp('ps', 'Pression de service PS (bar)', e.ps, { type: 'number', attr: 'step="any" min="0"' })}
       ${inp('volume', 'Volume V (L)', e.volume, { type: 'number', attr: 'step="any" min="0"' })}
       ${inp('dn', 'DN (tuyauterie)', e.dn, { type: 'number', attr: 'step="any" min="0"' })}
-      ${sel('atex', 'Zone ATEX', ATEX_ZONES, e.atex, { req: 1, blank: false })}
-      ${sel('status', "Statut de l'installation", STATUSES, e.status, { req: 1, blank: false })}
-      ${inp('building', 'Bâtiment', e.building)}
-      ${inp('workshop', 'Atelier', e.workshop)}
+      ${sel('atex', 'Zone ATEX', withCur(listOf('atex'), e.atex), e.atex, { req: 1, blank: false })}
+      ${sel('status', "Statut de l'installation", withCur(listOf('statuses'), e.status), e.status, { req: 1, blank: false })}
+      ${sel('building', 'Bâtiment', withCur(listOf('buildings'), e.building), e.building, { blank: emptyHint('buildings') })}
+      ${sel('workshop', 'Atelier', withCur(listOf('workshops'), e.workshop), e.workshop, { blank: emptyHint('workshops') })}
       ${inp('location', 'Localisation précise', e.location, { span: 'sm:col-span-2 lg:col-span-2' })}
       ${inp('commissioningDate', 'Date de mise en service', e.commissioningDate, { type: 'date' })}
       ${inp('ipMonths', 'Périodicité visite périodique (mois)', e.ipMonths, { type: 'number', attr: 'min="0"' })}
@@ -654,8 +717,8 @@ function attList(ro) {
     <span class="text-xs text-slate-500 whitespace-nowrap">${a.kind === 'file' ? 'Fichier' : 'Lien'}</span>
     ${ro ? '' : `<button type="button" class="text-red-700 text-xs underline" data-act="att-del" data-i="${i}">Retirer</button>`}</li>`).join('') || '<li class="text-slate-500">Aucune pièce jointe.</li>';
 }
-function openCtrl(id, espId) {
-  const c = id ? state.controls.find(x => x.id === id) : { espId: espId || '', type: CTRL_TYPES[0], status: 'Planifié', plannedDate: todayISO() };
+function openCtrl(id, espId, preset) {
+  const c = id ? state.controls.find(x => x.id === id) : { espId: espId || '', type: preset?.type || CTRL_TYPES[0], status: 'Planifié', plannedDate: preset?.due && preset.due >= todayISO() ? preset.due : todayISO() };
   if (id && (!c || !visibleIds().has(c.espId))) return;
   const locked = c.status === 'Clôturé' && !can('validate_control');
   const ro = !can('enter_control') || locked;
@@ -720,6 +783,34 @@ function auditBody() {
   const vis = userPoles().length ? visibleIds() : null;
   const rows = state.audit.filter(a => (!vis || vis.has(a.espId)) && (!q || JSON.stringify(a).toLowerCase().includes(q)));
   return rows.length ? auditTable(rows) + `<div class="px-3 py-2 text-xs text-slate-500 border-t">${rows.length} entrée(s) affichée(s) — les 300 plus récentes.</div>` : '<div class="p-4 text-sm text-slate-500">Aucune entrée.</div>';
+}
+
+/* =====================================================================
+   13b. RÉFÉRENTIELS (Admin) : ajout / suppression des valeurs proposées dans les colonnes des ESP
+   ===================================================================== */
+function viewLists() {
+  if (state.user.role !== 'admin') return '<div class="bg-white rounded-lg shadow p-8 text-center text-sm">Réservé à l\'administrateur.</div>';
+  return `<div class="mb-4"><h1 class="text-xl font-semibold">Référentiels</h1>
+    <p class="text-sm text-slate-600 mt-1">Valeurs proposées dans les formulaires et filtres. Le nombre à côté d'une valeur indique combien d'ESP (et d'utilisateurs, pour les pôles) l'utilisent : une valeur utilisée ne peut pas être supprimée.</p></div>
+  ${state.configError ? `<div class="mb-4 rounded-md bg-red-50 text-red-800 text-sm p-3" role="alert">Les référentiels ne peuvent pas être lus/enregistrés dans Firestore (${esc(state.configError)}). Autorisez la collection <code>config</code> dans les règles Firestore ; en attendant, les valeurs par défaut sont utilisées.</div>` : ''}
+  <div class="grid md:grid-cols-2 gap-4">${Object.keys(LIST_DEFS).map(listCard).join('')}</div>`;
+}
+function listCard(key) {
+  const d = LIST_DEFS[key], vals = listOf(key);
+  return `<section class="bg-white rounded-lg shadow-sm p-4" aria-labelledby="list-${key}">
+    <h2 id="list-${key}" class="text-sm font-semibold">${esc(d.label)} <span class="font-normal text-slate-500">(${vals.length})</span></h2>
+    <p class="text-xs text-slate-500 mt-0.5">${esc(d.hint)}</p>
+    <ul class="mt-3 flex flex-wrap gap-2">
+      ${vals.map(v => { const n = usageCount(key, v), locked = (d.locked || []).includes(v);
+        return `<li class="inline-flex items-center gap-1.5 rounded-full bg-slate-100 ring-1 ring-inset ring-slate-300 pl-3 ${locked ? 'pr-3' : 'pr-1'} py-1 text-sm">
+          <span>${esc(v)}</span>${n ? `<span class="text-xs text-slate-500">${n}</span>` : ''}
+          ${locked ? '<span class="text-xs text-slate-500">système</span>'
+            : `<button type="button" class="w-6 h-6 rounded-full text-red-700 hover:bg-red-100" data-act="list-del" data-key="${key}" data-val="${esc(v)}" aria-label="Supprimer ${esc(v)}" title="${n ? `Utilisé par ${n} : suppression impossible` : 'Supprimer'}">×</button>`}</li>`; }).join('')
+        || '<li class="text-sm text-slate-500">Aucune valeur.</li>'}
+    </ul>
+    <form data-form="listadd" data-key="${key}" class="mt-3 flex gap-2">
+      <input name="value" class="fld !mt-0" maxlength="80" required placeholder="Nouvelle valeur…" aria-label="Nouvelle valeur pour ${esc(d.label)}">
+      <button class="btn btn-primary" type="submit">Ajouter</button></form></section>`;
 }
 
 /* =====================================================================
@@ -948,6 +1039,17 @@ document.addEventListener('click', async ev => {
       case 'export-csv': exportCsv(); break;
       case 'plan-filter':   // depuis le tableau de bord : liste filtrée sur les échéances sans planification (même pôle)
         state.fEsp = { q: '', status: '', atex: '', due: '', pole: state.fDash.pole, plan: PLAN_FILTER }; location.hash = '#esp'; break;
+      case 'plan-new': openCtrl(null, el.dataset.esp, { type: el.dataset.type, due: el.dataset.due }); break;   // « À planifier » → saisie pré-remplie
+      case 'dash-reset': Object.assign(state.fDash, { due: '', plan: '', next: '' }); renderView(); break;
+      case 'list-del': {
+        if (state.user.role !== 'admin') return;
+        const key = el.dataset.key, v = el.dataset.val, d = LIST_DEFS[key];
+        if ((d.locked || []).includes(v)) return toast('Valeur système : suppression impossible.', 'err');
+        const n = usageCount(key, v);
+        if (n) return toast(`« ${v} » est utilisé par ${n} élément(s) : réaffectez-les avant de supprimer cette valeur.`, 'err');
+        if (!confirm(`Supprimer « ${v} » de la liste « ${d.label} » ? Cette action est tracée dans le journal d'audit.`)) return;
+        await saveList(key, listOf(key).filter(x => x !== v), { field: d.label, old: v, new: '' });
+        toast('Valeur supprimée'); break; }
       case 'esp-new': openEsp(null); break;
       case 'esp-open': openEsp(id); break;
       case 'esp-delete': {
@@ -986,7 +1088,8 @@ document.addEventListener('click', async ev => {
 document.addEventListener('input', ev => {
   const p = ev.target.dataset?.filter; if (!p) return;
   const [a, b] = p.split('.'); if (b) state[a][b] = ev.target.value; else state[a] = ev.target.value;
-  const t = { fEsp: ['#esp-table', espTable], fCtrl: ['#ctrl-table', ctrlTable], fAudit: ['#audit-table', auditBody] }[a];
+  if (p === 'fDash.pole') return renderView();          // le pôle recalcule aussi les compteurs et les graphiques
+  const t = { fEsp: ['#esp-table', espTable], fCtrl: ['#ctrl-table', ctrlTable], fAudit: ['#audit-table', auditBody], fDash: ['#dash-table', dashTable] }[a];
   if (t) $(t[0]).innerHTML = t[1](); else renderView();
 });
 
@@ -1035,6 +1138,16 @@ document.addEventListener('submit', async ev => {
       const e = espById(data.espId);
       const changed = await saveWithAudit({ col: 'controls', id, data, before, entity: 'Contrôle', label: `${data.type} – ${e?.tag || ''}`, espId: data.espId });
       closeModal(); toast(changed ? 'Contrôle enregistré' : 'Aucune modification', changed ? 'ok' : 'info');
+    }
+    if (kind === 'listadd') {
+      if (state.user.role !== 'admin') throw new Error("Réservé à l'administrateur.");
+      const key = form.dataset.key, d = LIST_DEFS[key], v = g('value').replace(/\s+/g, ' ');
+      if (!d) throw new Error('Liste inconnue.');
+      if (!v) throw new Error('Saisissez une valeur.');
+      const cur = listOf(key);
+      if (cur.some(x => x.toLowerCase() === v.toLowerCase())) throw new Error(`« ${v} » existe déjà dans cette liste.`);
+      await saveList(key, [...cur, v], { field: d.label, old: '', new: v });
+      toast('Valeur ajoutée');
     }
     if (kind === 'user') {
       const editing = !!form.dataset.id; const username = (editing ? form.dataset.id : g('username')).toLowerCase();
