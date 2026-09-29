@@ -18,6 +18,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-storage-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
 <style>
   body { font-variant-numeric: tabular-nums; }
@@ -438,6 +439,7 @@ function renderShell() {
       <div class="font-semibold">ESP Manager</div>
       <div class="flex items-center gap-3 text-sm">
         <span class="hidden sm:inline text-sky-100">${esc(state.user.displayName || state.user.username)}${state.user.role === 'admin' ? ' · admin' : ''}</span>
+        ${can('view_esp') ? `<button class="btn bg-white/10 hover:bg-white/20 text-white" data-act="export-xlsx" title="Exporter tous les équipements et contrôles visibles par votre compte">Exporter Excel</button>` : ''}
         <button class="btn bg-white/10 hover:bg-white/20 text-white" data-act="pwd">Mon mot de passe</button>
         <button class="btn bg-white/10 hover:bg-white/20 text-white" data-act="logout">Déconnexion</button>
       </div>
@@ -598,6 +600,43 @@ function exportCsv() {
   const lines = filteredEsp().map(({ e, d }) => cols.map(c => q(e[c])).concat([q(d.next), q(d.nextType), q(d.gap ? 'Oui' : 'Non')]).join(';'));
   const blob = new Blob(['\ufeff' + [head.map(q).join(';'), ...lines].join('\r\n')], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `esp_${todayISO()}.csv`; a.click();
+}
+
+/* Export Excel (.xlsx) : toutes les données Équipements + Contrôles visibles par le compte connecté, réparties sur deux feuilles */
+function exportXlsx() {
+  if (typeof XLSX === 'undefined') { toast("La librairie d'export Excel n'a pas pu être chargée (connexion internet requise).", 'err'); return; }
+  const esp = visibleEsp();
+  const espRows = esp.map(e => {
+    const d = dueOf(e);
+    return {
+      [FL.tag]: e.tag || '', [FL.name]: e.name || '', [FL.pole]: e.pole || '', [FL.serial]: e.serial || '',
+      [FL.manufacturer]: e.manufacturer || '', [FL.year]: e.year ?? '', [FL.category]: e.category || '',
+      [FL.type]: e.type || '', [FL.fluid]: e.fluid || '', [FL.fluidGroup]: e.fluidGroup || '',
+      [FL.ps]: e.ps ?? '', [FL.volume]: e.volume ?? '', [FL.dn]: e.dn ?? '', [FL.atex]: e.atex || '',
+      [FL.status]: e.status || '', [FL.building]: e.building || '', [FL.workshop]: e.workshop || '',
+      [FL.location]: e.location || '', [FL.commissioningDate]: fmtDate(e.commissioningDate),
+      [FL.ipMonths]: e.ipMonths ?? '', [FL.rpMonths]: e.rpMonths ?? '',
+      'Dernière visite périodique': fmtDate(d.lastIP), 'Dernière requalification': fmtDate(d.lastRP),
+      'Prochaine échéance': fmtDate(d.next), 'Type de prochaine échéance': d.nextType || '',
+      [FL.notes]: e.notes || ''
+    };
+  });
+  const vis = visibleIds();
+  const ctrlRows = state.controls.filter(c => vis.has(c.espId)).map(c => {
+    const e = espById(c.espId), gaps = gapsOf(c);
+    return {
+      [FL.tag]: e?.tag || '(supprimé)', [FL.name]: e?.name || '', [FL.type]: c.type || '', 'Statut': c.status || '',
+      [FL.plannedDate]: fmtDate(c.plannedDate), [FL.doneDate]: fmtDate(c.doneDate), [FL.inspector]: c.inspector || '',
+      [FL.result]: c.result || '', [FL.gapRequired]: gapOf(c), "Nombre d'écarts": gaps.length,
+      "N° d'intervention CARL": gaps.map(g => g.number).filter(Boolean).join(', '),
+      'Désignation des écarts': gaps.map(g => g.label).filter(Boolean).join(' / '),
+      [FL.comment]: c.comment || '', 'Pièces jointes': (c.attachments || []).length
+    };
+  }).sort((a, b) => (a[FL.tag] || '').localeCompare(b[FL.tag] || '', 'fr'));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(espRows), 'Équipements');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ctrlRows), 'Contrôles');
+  XLSX.writeFile(wb, `esp_export_${todayISO()}.xlsx`);
 }
 
 /* =====================================================================
@@ -1130,6 +1169,7 @@ document.addEventListener('click', async ev => {
       case 'logout': logout(); break;
       case 'pwd': openPwd(); break;
       case 'export-csv': exportCsv(); break;
+      case 'export-xlsx': exportXlsx(); break;
       case 'plan-filter':   // depuis le tableau de bord : liste filtrée sur les échéances sans planification (même pôle)
         state.fEsp = { q: '', status: '', atex: '', due: '', pole: state.fDash.pole, plan: PLAN_FILTER }; location.hash = '#esp'; break;
       case 'plan-new': openCtrl(null, el.dataset.esp, { type: el.dataset.type, due: el.dataset.due }); break;   // « À planifier » → saisie pré-remplie
